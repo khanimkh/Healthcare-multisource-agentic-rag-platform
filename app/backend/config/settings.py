@@ -16,7 +16,9 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
 
-    glue_database_name: str = "healthcare_metadata_catalog"
+    glue_database_name: str = "healthcare_rag_catalog"
+    
+    athena_output_s3_uri: str = "s3://your-bucket/athena-results/"
 
     class Config:
         env_file = ".env"

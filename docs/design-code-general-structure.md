@@ -557,3 +557,300 @@ Register Global Endpoints
         ▼
 Application Ready
 ```
+-----------------------------------
+
+# aws-storage file
+
+## dictionary:
+
+## Example from an AWS/OpenSearch project
+
+Suppose your search function returns search results:
+
+```python
+results: List[Dict[str, Any]] = [
+    {
+        "document_id": "doc1",
+        "text": "Patient has diabetes.",
+        "score": 0.92,
+        "metadata": {
+            "source": "ehr.pdf"
+        }
+    },
+    {
+        "document_id": "doc2",
+        "text": "Blood pressure is normal.",
+        "score": 0.85,
+        "metadata": {
+            "source": "lab.csv"
+        }
+    }
+]
+```
+
+Here:
+
+- `results` is a **list**.
+- Each item is a **dictionary**.
+- The keys (`"document_id"`, `"text"`, `"score"`, `"metadata"`) are all **strings**.
+- The values can be **strings**, **floats**, or even **another dictionary**, which is why the value type is `Any`.
+
+---
+
+### Visual representation
+
+```python
+results = [
+    {
+        "id": 1,
+        "text": "Hello",
+        "score": 0.95
+    },
+    {
+        "id": 2,
+        "text": "World",
+        "score": 0.88
+    }
+]
+```
+
+```text
+List
+│
+├── Dictionary
+│     ├── Key: "id"    -> Value: 1
+│     ├── Key: "text"  -> Value: "Hello"
+│     └── Key: "score" -> Value: 0.95
+│
+└── Dictionary
+      ├── Key: "id"    -> Value: 2
+      ├── Key: "text"  -> Value: "World"
+      └── Key: "score" -> Value: 0.88
+```
+
+So, **`List[Dict[str, Any]]` means "a list of dictionaries where every key is a string and every value can be of any type."**
+
+-------------------------------
+
+## upload orginal file, read document, classify docs, create chunck and embedings, create bulk list: 
+
+```python
+from app.backend.services.aws_storage import AWSStorage, OpenSearchVectorStore
+from app.backend.services.bedrock_service import BedrockService
+from app.backend.utils.document_loader import load_pdf
+from app.backend.utils.chunking import split_text_into_chunks
+
+
+def ingest_uploaded_pdf(file_path: str, file_name: str):
+    """
+    Full ingestion pipeline:
+    1. Upload PDF to S3
+    2. Read PDF text
+    3. Split text into chunks
+    4. Create embeddings
+    5. Store chunks + vectors in OpenSearch
+    """
+
+    # Initialize services
+    storage = AWSStorage()
+    bedrock = BedrockService()
+    vector_store = OpenSearchVectorStore()
+
+    # Step 1: Upload original file to S3
+    upload_result = storage.upload_file_to_s3(
+        file_path=file_path,
+        file_name=file_name
+    )
+
+    file_id = upload_result["file_id"]
+    s3_uri = upload_result["s3_uri"]
+
+    # Step 2: Read document text
+    text = load_pdf(file_path)
+
+    # Step 3: Classify document type
+    document_type = bedrock.classify_text(text)
+
+    # Step 4: Split text into chunks
+    text_chunks = split_text_into_chunks(
+        text=text,
+        chunk_size=1000,
+        chunk_overlap=200
+    )
+
+    # Step 5: Create embedding for each chunk
+    chunks = []
+
+    for chunk_text in text_chunks:
+        embedding = bedrock.create_embedding(chunk_text)
+
+        chunks.append({
+            "text": chunk_text,
+            "embedding": embedding
+        })
+
+    # Step 6: Create index if needed + bulk save vectors
+    vector_store.index_chunks(
+        chunks=chunks,
+        file_id=file_id,
+        file_name=file_name,
+        document_type=document_type,
+        s3_uri=s3_uri,
+        metadata={
+            "source": "user_upload"
+        },
+        batch_size=500
+    )
+
+    return {
+        "status": "success",
+        "file_id": file_id,
+        "file_name": file_name,
+        "document_type": document_type,
+        "s3_uri": s3_uri,
+        "chunks_indexed": len(chunks)
+    }
+```
+
+Example call:
+
+```python
+result = ingest_uploaded_pdf(
+    file_path="data/clinical_guideline.pdf",
+    file_name="clinical_guideline.pdf"
+)
+
+print(result)
+```
+
+The flow is:
+
+```text
+PDF
+-> upload to S3
+-> extract text
+-> classify document type
+-> split into chunks
+-> create embedding per chunk
+-> create OpenSearch index if it does not exist
+-> bulk save all chunks into OpenSearch
+```
+
+Inside this line:
+
+```python
+vector_store.index_chunks(...)
+```
+
+your function automatically calls:
+
+```python
+self.create_index_if_not_exists(dimension=dimension)
+```
+
+So you do not need to call `create_index_if_not_exists()` manually outside.
+
+------------------------------------
+
+# AI service layering: model_service.py, bedrock_service.py, embedding_service.py, llm_service.py, memory_service.py
+
+## Purpose
+
+As a project grows, a single service file that both talks to the raw API **and** implements task-specific logic becomes hard to reuse. The fix is to split the "AI service" into layers, each with **one job**, so higher layers can be swapped or reused without touching the raw client code.
+
+> **Rule of thumb:** only one file in the whole project should ever create the raw client (`boto3.client("bedrock-runtime")`). Everything else calls that file instead of calling AWS directly.
+
+---
+
+## The layers
+
+```text
+Agents (router, rag, sql, summarization, final answer)
+        │
+        ▼
+  LLMService                 <- text generation only (generate, generate_with_history)
+        │
+        ▼
+Ingestion (rag_utils.py,             BedrockService          <- task-specific: classify_text
+document_ingestion_workflow.py)            │
+        │                                  ├──► ModelService <- create_embedding delegates here
+        ▼                                  │           │
+  EmbeddingService  ◄────────────────────────┘           ▼
+        │                                          Amazon Bedrock Runtime
+        ▼
+Amazon Bedrock Runtime
+```
+
+In plain words:
+
+```text
+ModelService      = the ONLY file that owns the boto3 bedrock-runtime client.
+                    Exposes two generic primitives:
+                    invoke_text_model(prompt, ...)
+                    invoke_embedding_model(text)
+
+EmbeddingService  = single source of truth for "turn text into a vector".
+                    Composes ModelService. Used by ingestion (chunk embeddings)
+                    and, later, by retrieval (embedding the user's question).
+
+LLMService        = single source of truth for "turn a prompt into an answer".
+                    Composes ModelService. Used by agents that reason/generate
+                    text (router, rag, sql, summarization, final answer).
+
+BedrockService    = task-specific wrapper kept for the ingestion pipeline.
+                    classify_text() builds its own prompt and calls ModelService.
+                    create_embedding() delegates to EmbeddingService instead of
+                    duplicating embedding logic.
+
+MemoryService     = conversation/session history. Not part of the Bedrock chain -
+                    it stores turns in Postgres (durable) and caches the most
+                    recent turns in Redis (fast lookups), so LLMService.generate_with_history()
+                    has something to read from.
+```
+
+---
+
+## Why split `BedrockService` and `ModelService` instead of one class?
+
+Before the split, `BedrockService` created its own `boto3` client and had the classify/embedding prompt logic mixed with the raw `invoke_model` boilerplate. That meant:
+
+- `ModelService` would have had to duplicate that same boilerplate for the question-answering path, **or**
+- every new agent would have imported `BedrockService` and reused a class named after one specific task (classification), which is confusing once the file also generates SQL, summaries, and final answers.
+
+Splitting them means the raw call (`invoke_model`, `json.dumps`, `contentType`, response parsing) lives in exactly one place, and every higher-level file only decides **what prompt** to send and **how to shape the result**.
+
+---
+
+## Responsibility table
+
+| File | Owns raw client? | Responsibility | Used by |
+| --- | --- | --- | --- |
+| `model_service.py` | ✅ Yes | Generic `invoke_text_model` / `invoke_embedding_model` calls to Bedrock Runtime | `bedrock_service.py`, `embedding_service.py`, `llm_service.py` |
+| `embedding_service.py` | No | Turn text into a vector (single chunk or batch) | `bedrock_service.py` (ingestion), future retrieval/query embedding |
+| `llm_service.py` | No | Turn a prompt (optionally with conversation history) into a generated answer | Future agents: router, rag, sql, summarization, final answer |
+| `bedrock_service.py` | No | Task-specific ingestion helpers: classify uploaded content, embed chunks | `rag_utils.py`, `document_ingestion_workflow.py` |
+| `memory_service.py` | N/A (Postgres + Redis, not Bedrock) | Store/retrieve conversation turns per session | `llm_service.generate_with_history()`, router agent |
+
+---
+
+## Flow
+
+```text
+Raw model call
+   │
+   ▼
+ModelService.invoke_text_model() / invoke_embedding_model()
+   │
+   ├──► EmbeddingService.create_embedding()   -> used at ingestion + retrieval time
+   │        │
+   │        ▼
+   │    BedrockService.create_embedding()      -> delegates, no duplicate logic
+   │
+   └──► LLMService.generate() / generate_with_history()
+            │
+            ▼
+        Future agents build task prompts and call LLMService
+```
+
+------------------------------------
+
