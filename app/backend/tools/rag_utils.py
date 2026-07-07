@@ -1,6 +1,6 @@
 from typing import List, Dict, Any
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from app.backend.services.bedrock_service import BedrockService
+from app.backend.services.embedding_service import EmbeddingService
 
 
 def chunk_documents(
@@ -19,11 +19,11 @@ def chunk_documents(
 def create_embeddings_for_chunks(
     chunks: List[str]
 ) -> List[Dict[str, Any]]:
-    bedrock = BedrockService()
+    embedding_service = EmbeddingService()
     embedded_chunks = []
 
     for chunk in chunks:
-        embedding = bedrock.create_embedding(chunk)
+        embedding = embedding_service.create_embedding(chunk)
 
         embedded_chunks.append({
             "text": chunk,

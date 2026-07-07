@@ -30,10 +30,6 @@ def load_csv(file_path: str) -> pd.DataFrame:
     return pd.read_csv(file_path)
 
 
-def load_excel(file_path: str) -> pd.DataFrame:
-    return pd.read_excel(file_path)
-
-
 def load_pdf(file_path: str) -> str:
     reader = PdfReader(file_path)
     pages = []
@@ -61,14 +57,8 @@ def load_image_ocr(file_path: str) -> str:
     return pytesseract.image_to_string(image)
 
 
-def load_data(file_path: str):
+def load_document(file_path: str) -> str:
     ext = os.path.splitext(file_path.lower())[1]
-
-    if ext == ".csv":
-        return load_csv(file_path)
-
-    if ext in [".xlsx", ".xls"]:
-        return load_excel(file_path)
 
     if ext == ".pdf":
         return load_pdf(file_path)
@@ -82,18 +72,4 @@ def load_data(file_path: str):
     if ext in IMAGE_EXTENSIONS:
         return load_image_ocr(file_path)
 
-    raise ValueError(f"Unsupported file type: {ext}")
-
-
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [
-        col.strip().lower().replace(" ", "_")
-        for col in df.columns
-    ]
-    df = df.drop_duplicates()
-    return df
-
-
-def clean_text(text: str) -> str:
-    return " ".join(text.split())
+    raise ValueError(f"Unsupported document type: {ext}")

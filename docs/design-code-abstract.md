@@ -1,3 +1,5 @@
+> **Outdated**: `BedrockService` was removed. `classify_text()` moved to `agents/classification_agent.py` (`ClassificationAgent.classify_document()` / `classify_structured_data()`), and `create_embedding()` moved to `services/embedding_service.py`. The overall flow below (classify + embed, then store) is still accurate conceptually — only the class name and file have changed.
+
 # bedrock_service:  
                
                 User uploads document

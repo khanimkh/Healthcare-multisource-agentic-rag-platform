@@ -1,5 +1,7 @@
 These functions belong in a **tools** or **preprocessing** module because they perform **data loading and cleaning** before the data is passed to AI agents or databases. Each function has a single responsibility.
 
+> **Partially outdated**: `clean_dataframe()` and `clean_text()` (and `load_data()`, `load_excel()`) were removed from `data_loader.py` — they had zero call sites after the workflows/services refactor (`structured_ingestion_workflow.py` calls `load_csv()` directly and does its own column handling via `pandas`; nothing ever called the Excel or generic-dispatch paths). The loader functions below (`load_docx()`, etc.) are still current.
+
 ---
 
 # 1. `load_docx()`

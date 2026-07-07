@@ -12,7 +12,11 @@ redis
 opensearch-py
 requests-aws4auth
 langchain-text-splitters
+langgraph
 pypdf
 python-docx
 pillow
 pytesseract
+networkx
+spacy
+# after installing requirements, also run: python -m spacy download en_core_web_sm

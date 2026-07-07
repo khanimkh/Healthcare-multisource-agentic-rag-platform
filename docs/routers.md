@@ -1,3 +1,5 @@
+> **Outdated**: this walkthrough documents an earlier version of `api/routes.py` that called `tools.aws_storage`, `tools.database.RDSStorage`, and `glue_catalog.register_metadata()` directly from the route handler. That version no longer exists — `/upload` now delegates to `DocumentIngestionWorkflow`/`StructuredIngestionWorkflow`, and a new `/ask` endpoint calls `QuestionWorkflow`. Kept here for the line-by-line explanations of FastAPI/Python concepts (imports, `UploadFile`, etc.), which are still accurate; the step-by-step flow and the "Router"/"Endpoint"/"Function" walkthrough sections describing the old handler are not.
+
 # Step 1. User uploads a file
 
 ```text

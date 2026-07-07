@@ -752,7 +752,7 @@ So you do not need to call `create_index_if_not_exists()` manually outside.
 
 ------------------------------------
 
-# AI service layering: model_service.py, bedrock_service.py, embedding_service.py, llm_service.py, memory_service.py
+# AI service layering: model_service.py, embedding_service.py, llm_service.py, memory_service.py
 
 ## Purpose
 
@@ -765,59 +765,59 @@ As a project grows, a single service file that both talks to the raw API **and**
 ## The layers
 
 ```text
-Agents (router, rag, sql, summarization, final answer)
-        │
-        ▼
-  LLMService                 <- text generation only (generate, generate_with_history)
-        │
-        ▼
-Ingestion (rag_utils.py,             BedrockService          <- task-specific: classify_text
-document_ingestion_workflow.py)            │
-        │                                  ├──► ModelService <- create_embedding delegates here
-        ▼                                  │           │
-  EmbeddingService  ◄────────────────────────┘           ▼
-        │                                          Amazon Bedrock Runtime
-        ▼
-Amazon Bedrock Runtime
+Ingestion (rag_utils.py,                    Agents (router, rag, sql, s3,
+document_ingestion_workflow.py,             summarization, final answer)
+structured_ingestion_workflow.py)                  │
+        │                                          ▼
+        ▼                                    LLMService          <- text generation only
+  EmbeddingService  ◄──┐                           │                 (generate, generate_with_history)
+        │              │                           │
+        │        ClassificationAgent                │
+        │        (classify_document,                │
+        │        classify_structured_data)          │
+        │              │                            │
+        ▼              ▼                            ▼
+              ModelService  ◄─────────────────────────
+                    │
+                    ▼
+            Amazon Bedrock Runtime
 ```
 
 In plain words:
 
 ```text
-ModelService      = the ONLY file that owns the boto3 bedrock-runtime client.
-                    Exposes two generic primitives:
-                    invoke_text_model(prompt, ...)
-                    invoke_embedding_model(text)
+ModelService         = the ONLY file that owns the boto3 bedrock-runtime client.
+                       Exposes two generic primitives:
+                       invoke_text_model(prompt, ...)
+                       invoke_embedding_model(text)
 
-EmbeddingService  = single source of truth for "turn text into a vector".
-                    Composes ModelService. Used by ingestion (chunk embeddings)
-                    and, later, by retrieval (embedding the user's question).
+EmbeddingService      = single source of truth for "turn text into a vector".
+                       Composes ModelService. Used by ingestion (chunk embeddings)
+                       and by retrieval (embedding the user's question in RAGAgent).
 
-LLMService        = single source of truth for "turn a prompt into an answer".
-                    Composes ModelService. Used by agents that reason/generate
-                    text (router, rag, sql, summarization, final answer).
+LLMService            = single source of truth for "turn a prompt into an answer".
+                       Composes ModelService. Used by agents that reason/generate
+                       text (router, rag, sql, s3, summarization, classification,
+                       final answer, graph_rag).
 
-BedrockService    = task-specific wrapper kept for the ingestion pipeline.
-                    classify_text() builds its own prompt and calls ModelService.
-                    create_embedding() delegates to EmbeddingService instead of
-                    duplicating embedding logic.
+ClassificationAgent    = classifies uploaded content into a category, via LLMService +
+                       prompts/classification_prompt.py. Used by both ingestion
+                       workflows (documents and structured datasets) and reused by
+                       question_graph.py's "classification" route.
 
-MemoryService     = conversation/session history. Not part of the Bedrock chain -
-                    it stores turns in Postgres (durable) and caches the most
-                    recent turns in Redis (fast lookups), so LLMService.generate_with_history()
-                    has something to read from.
+MemoryService         = conversation/session history. Not part of the Bedrock chain -
+                       it stores turns in Postgres (durable) and caches the most
+                       recent turns in Redis via CacheService (fast lookups), so
+                       LLMService.generate_with_history() has something to read from.
 ```
+
+`services/bedrock_service.py` used to sit here as a task-specific wrapper (`classify_text`, `create_embedding`) between the agents/workflows and `ModelService`. It was removed once both responsibilities had a proper home elsewhere: classification moved to `ClassificationAgent` (which builds its prompt via `prompts/classification_prompt.py` and reasons through `LLMService`, consistent with every other agent), and embedding moved to calling `EmbeddingService` directly. Keeping `BedrockService` around afterward would have meant an empty passthrough class with no distinct responsibility — the same anti-pattern this layering exists to avoid.
 
 ---
 
-## Why split `BedrockService` and `ModelService` instead of one class?
+## Why split `ModelService` from everything above it?
 
-Before the split, `BedrockService` created its own `boto3` client and had the classify/embedding prompt logic mixed with the raw `invoke_model` boilerplate. That meant:
-
-- `ModelService` would have had to duplicate that same boilerplate for the question-answering path, **or**
-- every new agent would have imported `BedrockService` and reused a class named after one specific task (classification), which is confusing once the file also generates SQL, summaries, and final answers.
-
-Splitting them means the raw call (`invoke_model`, `json.dumps`, `contentType`, response parsing) lives in exactly one place, and every higher-level file only decides **what prompt** to send and **how to shape the result**.
+If prompt-building and raw `invoke_model` boilerplate live in the same class, every new task (classification, SQL generation, summarization, routing) either duplicates that boilerplate or gets crammed into one class named after a single task. Splitting them means the raw call (`invoke_model`, `json.dumps`, `contentType`, response parsing) lives in exactly one place, and every higher-level file only decides **what prompt** to send and **how to shape the result**.
 
 ---
 
@@ -825,11 +825,11 @@ Splitting them means the raw call (`invoke_model`, `json.dumps`, `contentType`, 
 
 | File | Owns raw client? | Responsibility | Used by |
 | --- | --- | --- | --- |
-| `model_service.py` | ✅ Yes | Generic `invoke_text_model` / `invoke_embedding_model` calls to Bedrock Runtime | `bedrock_service.py`, `embedding_service.py`, `llm_service.py` |
-| `embedding_service.py` | No | Turn text into a vector (single chunk or batch) | `bedrock_service.py` (ingestion), future retrieval/query embedding |
-| `llm_service.py` | No | Turn a prompt (optionally with conversation history) into a generated answer | Future agents: router, rag, sql, summarization, final answer |
-| `bedrock_service.py` | No | Task-specific ingestion helpers: classify uploaded content, embed chunks | `rag_utils.py`, `document_ingestion_workflow.py` |
-| `memory_service.py` | N/A (Postgres + Redis, not Bedrock) | Store/retrieve conversation turns per session | `llm_service.generate_with_history()`, router agent |
+| `model_service.py` | ✅ Yes | Generic `invoke_text_model` / `invoke_embedding_model` calls to Bedrock Runtime | `embedding_service.py`, `llm_service.py` |
+| `embedding_service.py` | No | Turn text into a vector (single chunk or batch) | `rag_utils.py` (ingestion), `rag_agent.py` (retrieval) |
+| `llm_service.py` | No | Turn a prompt (optionally with conversation history) into a generated answer | All agents: router, rag, sql, s3, graph_rag, summarization, classification, final answer |
+| `agents/classification_agent.py` | No | Classify a document's text or a structured dataset's columns into a category | `document_ingestion_workflow.py`, `structured_ingestion_workflow.py`, `question_graph.py` |
+| `memory_service.py` | N/A (Postgres + Redis, not Bedrock) | Store/retrieve conversation turns per session | `question_graph.py`, `question_workflow.py` |
 
 ---
 
@@ -842,14 +842,13 @@ Raw model call
 ModelService.invoke_text_model() / invoke_embedding_model()
    │
    ├──► EmbeddingService.create_embedding()   -> used at ingestion + retrieval time
-   │        │
-   │        ▼
-   │    BedrockService.create_embedding()      -> delegates, no duplicate logic
    │
-   └──► LLMService.generate() / generate_with_history()
-            │
-            ▼
-        Future agents build task prompts and call LLMService
+   ├──► LLMService.generate()  ◄──────────────── ClassificationAgent builds a prompt via
+   │        │                                    prompts/classification_prompt.py and calls
+   │        ▼                                    this, same as every other agent
+   │    Agents build task prompts and call LLMService
+   │
+   └──► LLMService.generate_with_history()    -> reads prior turns from MemoryService
 ```
 
 ------------------------------------

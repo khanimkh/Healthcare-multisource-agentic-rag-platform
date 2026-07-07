@@ -139,3 +139,64 @@ class OpenSearchVectorStore:
             actions,
             chunk_size=batch_size
         )
+
+    def search_chunks(
+        self,
+        embedding: List[float],
+        k: int = 5,
+        document_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        knn_clause = {
+            "knn": {
+                "embedding": {
+                    "vector": embedding,
+                    "k": k
+                }
+            }
+        }
+
+        if document_type:
+            query = {
+                "bool": {
+                    "must": [knn_clause],
+                    "filter": [{"term": {"document_type": document_type}}]
+                }
+            }
+        else:
+            query = knn_clause
+
+        response = self.client.search(
+            index=settings.opensearch_index,
+            body={
+                "size": k,
+                "query": query
+            }
+        )
+
+        return [
+            {
+                "text": hit["_source"]["text"],
+                "score": hit["_score"],
+                "file_id": hit["_source"].get("file_id"),
+                "chunk_id": hit["_source"].get("chunk_id"),
+                "file_name": hit["_source"].get("file_name"),
+                "document_type": hit["_source"].get("document_type"),
+                "s3_uri": hit["_source"].get("s3_uri")
+            }
+            for hit in response["hits"]["hits"]
+        ]
+
+    def get_document_text(self, file_id: str) -> str:
+        response = self.client.search(
+            index=settings.opensearch_index,
+            body={
+                "size": 1000,
+                "query": {
+                    "term": {"file_id": file_id}
+                },
+                "sort": [{"chunk_index": "asc"}]
+            }
+        )
+
+        hits = response["hits"]["hits"]
+        return "\n".join(hit["_source"]["text"] for hit in hits)

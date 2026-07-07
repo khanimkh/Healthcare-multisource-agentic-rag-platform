@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Dict, List, Optional
 
 from sqlalchemy import create_engine, Column, String, DateTime, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -69,12 +69,28 @@ class DocumentStore:
             if document_type:
                 record.document_type = document_type
 
-            if status in ["processed", "registered", "indexed"]:
+            if status in ["registered", "indexed"]:
                 record.processed_at = datetime.now(timezone.utc)
 
             if error_message:
                 record.error_message = error_message
 
             session.commit()
+        finally:
+            session.close()
+
+    def list_indexed_document_records(self) -> List[Dict[str, str]]:
+        session = self.SessionLocal()
+        try:
+            records = (
+                session.query(DocumentRecord)
+                .filter(DocumentRecord.status.in_(["indexed", "registered"]))
+                .all()
+            )
+
+            return [
+                {"file_id": record.file_id, "file_name": record.file_name}
+                for record in records
+            ]
         finally:
             session.close()

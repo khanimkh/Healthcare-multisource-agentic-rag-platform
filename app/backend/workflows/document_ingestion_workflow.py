@@ -1,11 +1,13 @@
 from pathlib import Path
 from typing import Dict, Any
 
+from app.backend.agents.classification_agent import ClassificationAgent
 from app.backend.services.aws_storage_service import AWSStorage, OpenSearchVectorStore
-from app.backend.services.bedrock_service import BedrockService
 from app.backend.services.document_store_service import DocumentStore
+from app.backend.services.graph_store_service import GraphStoreService
 
 from app.backend.tools.data_loader import load_document
+from app.backend.tools.entity_extraction import extract_entities_and_relationships
 from app.backend.tools.rag_utils import chunk_documents, create_embeddings_for_chunks
 
 
@@ -13,8 +15,9 @@ class DocumentIngestionWorkflow:
     def __init__(self):
         self.storage = AWSStorage()
         self.vector_store = OpenSearchVectorStore()
-        self.bedrock = BedrockService()
+        self.classification_agent = ClassificationAgent()
         self.document_store = DocumentStore()
+        self.graph_store = GraphStoreService()
 
     def ingest(
         self,
@@ -48,7 +51,18 @@ class DocumentIngestionWorkflow:
             if not text or not text.strip():
                 raise ValueError("No text could be extracted from the document.")
 
-            document_type = self.bedrock.classify_text(text)
+            document_type = self.classification_agent.classify_document(text)
+
+            extraction = extract_entities_and_relationships(text)
+
+            for relationship in extraction["relationships"]:
+                self.graph_store.upsert_edge(
+                    source_name=relationship["source"],
+                    target_name=relationship["target"],
+                    relationship=relationship["relationship"],
+                    file_id=file_id,
+                    evidence=relationship["evidence"]
+                )
 
             text_chunks = chunk_documents(text)
 
@@ -79,7 +93,9 @@ class DocumentIngestionWorkflow:
                 "file_name": file_name,
                 "s3_uri": s3_uri,
                 "document_type": document_type,
-                "chunks_indexed": len(embedded_chunks)
+                "chunks_indexed": len(embedded_chunks),
+                "entities_extracted": len(extraction["entities"]),
+                "relationships_extracted": len(extraction["relationships"])
             }
 
         except Exception as error:

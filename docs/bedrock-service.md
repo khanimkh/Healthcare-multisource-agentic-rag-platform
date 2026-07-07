@@ -1,3 +1,5 @@
+> **Outdated**: `services/bedrock_service.py` has been removed. This walkthrough describes its original design, where `BedrockService` owned the raw `boto3` `bedrock-runtime` client directly and called `self.client.invoke_model(...)` itself. That responsibility now belongs solely to `services/model_service.py` (see `docs/model-service.md` and the "AI service layering" section of `docs/design-code-general-structure.md`). Classification moved to `agents/classification_agent.py` (via `LLMService` + `prompts/classification_prompt.py`); embeddings moved to `services/embedding_service.py`. Kept here for the general explanation of the Bedrock request/response shape (`invoke_model`, request body, parsing), which is still accurate for `model_service.py`.
+
 1. Use an LLM (Claude on Bedrock) to classify healthcare documents.
 2. Use an embedding model (Titan Embeddings) to convert text into vectors for semantic search.
 

@@ -14,7 +14,7 @@ They do not implement low-level AWS logic themselves. Instead, they call service
 - `DocumentStore`
 - `GlueCatalog`
 - `OpenSearchVectorStore`
-- `BedrockService`
+- `ClassificationAgent`
 - `data_loader`
 - `rag_utils`
 
@@ -155,10 +155,10 @@ The file is now marked as being processed.
 #### Step 4: Read CSV
 
 ```python
-df = pd.read_csv(file_path)
+df = load_csv(file_path)
 ```
 
-The CSV is loaded as a pandas DataFrame. This is needed because Glue needs the schema:
+The CSV is loaded through `tools/data_loader.py`'s `load_csv()` (not `pandas` directly), keeping all file-loading logic in one place, the same way `document_ingestion_workflow.py` loads text through `load_document()`. This is needed because Glue needs the schema:
 
 ```text
 column names
@@ -277,7 +277,7 @@ This class controls the full document ingestion process.
 def __init__(self):
 	self.storage = AWSStorage()
 	self.vector_store = OpenSearchVectorStore()
-	self.bedrock = BedrockService()
+	self.classification_agent = ClassificationAgent()
 	self.document_store = DocumentStore()
 ```
 
@@ -285,7 +285,7 @@ def __init__(self):
 | --- | --- |
 | `AWSStorage` | Uploads original document to S3 |
 | `OpenSearchVectorStore` | Stores chunk embeddings in OpenSearch |
-| `BedrockService` | Classifies text and creates embeddings |
+| `ClassificationAgent` | Classifies text into a document category (chunk embeddings are created separately via `rag_utils.create_embeddings_for_chunks`, backed by `EmbeddingService`) |
 | `DocumentStore` | Tracks document status in RDS |
 
 ### `ingest()`
@@ -352,10 +352,10 @@ raise ValueError("No text could be extracted from the document.")
 #### Step 5: Classify document type
 
 ```python
-document_type = self.bedrock.classify_text(text)
+document_type = self.classification_agent.classify_document(text)
 ```
 
-Bedrock classifies the document into categories such as:
+`ClassificationAgent` (backed by `LLMService` + `prompts/classification_prompt.py`) classifies the document into categories such as:
 
 ```text
 clinical guideline

@@ -82,7 +82,7 @@ So you can say:
 
 ## Why two files instead of one
 
-This mirrors the same layering used for the Bedrock services (`model_service.py` owns the raw client; `bedrock_service.py`, `embedding_service.py`, `llm_service.py` compose it): exactly one file owns the raw Redis client, and the domain-specific file builds on top of it instead of duplicating connection logic.
+This mirrors the same layering used for the Bedrock services (`model_service.py` owns the raw client; `embedding_service.py`, `llm_service.py`, and `agents/classification_agent.py` compose it): exactly one file owns the raw Redis client, and the domain-specific file builds on top of it instead of duplicating connection logic.
 
 ```text
 memory_service.py (conversation-specific)

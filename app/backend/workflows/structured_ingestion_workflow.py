@@ -1,11 +1,11 @@
 from pathlib import Path
 from typing import Dict, Any
 
-import pandas as pd
-
+from app.backend.agents.classification_agent import ClassificationAgent
 from app.backend.services.aws_storage_service import AWSStorage
 from app.backend.services.document_store_service import DocumentStore
 from app.backend.services.glue_catalog_service import GlueCatalog
+from app.backend.tools.data_loader import load_csv
 from app.backend.config.settings import settings
 
 
@@ -14,6 +14,7 @@ class StructuredIngestionWorkflow:
         self.storage = AWSStorage()
         self.document_store = DocumentStore()
         self.glue_catalog = GlueCatalog()
+        self.classification_agent = ClassificationAgent()
 
     def ingest_csv(
         self,
@@ -42,7 +43,9 @@ class StructuredIngestionWorkflow:
                 status="processing"
             )
 
-            df = pd.read_csv(file_path)
+            df = load_csv(file_path)
+
+            document_type = self.classification_agent.classify_structured_data(df)
 
             dataset_name = Path(file_name).stem
 
@@ -55,7 +58,7 @@ class StructuredIngestionWorkflow:
             self.document_store.update_status(
                 file_id=file_id,
                 status="registered",
-                document_type="structured_dataset"
+                document_type=document_type
             )
 
             return {
@@ -63,6 +66,7 @@ class StructuredIngestionWorkflow:
                 "file_id": file_id,
                 "file_name": file_name,
                 "s3_uri": s3_uri,
+                "document_type": document_type,
                 "glue_database": settings.glue_database_name,
                 "glue_table": table_name,
                 "rows": len(df),
