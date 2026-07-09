@@ -5,6 +5,10 @@ from app.backend.prompts.final_answer_prompt import (
     build_final_answer_prompt
 )
 from app.backend.services.llm_service import LLMService
+from app.backend.utils.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class FinalAnswerAgent:
@@ -33,6 +37,8 @@ class FinalAnswerAgent:
             max_tokens=800,
             temperature=0.3
         )
+
+        logger.info(f"Composed final answer for route={route!r}.")
 
         return {
             "answer": final_answer,

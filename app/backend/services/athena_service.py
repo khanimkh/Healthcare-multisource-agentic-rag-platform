@@ -13,6 +13,8 @@ class AthenaService:
         self.glue_catalog = GlueCatalog()
 
     def list_tables(self) -> List[str]:
+        self.glue_catalog.ensure_database_exists()
+
         paginator = self.glue_catalog.client.get_paginator("get_tables")
 
         tables = []

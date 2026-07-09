@@ -6,6 +6,10 @@ from app.backend.prompts.router_prompt import (
     build_router_prompt
 )
 from app.backend.services.llm_service import LLMService
+from app.backend.utils.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class RouterAgent:
@@ -36,6 +40,8 @@ class RouterAgent:
         route = response.strip().lower()
 
         if route not in ROUTES:
+            logger.warning(f"Router returned invalid route {route!r}, falling back to 'rag'.")
             return "rag"
 
+        logger.info(f"Routed question to {route!r}.")
         return route

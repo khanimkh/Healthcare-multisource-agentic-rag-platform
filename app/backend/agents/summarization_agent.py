@@ -5,6 +5,10 @@ from app.backend.prompts.summary_prompt import SUMMARY_SYSTEM_PROMPT, build_summ
 from app.backend.services.aws_storage_service import OpenSearchVectorStore
 from app.backend.services.llm_service import LLMService
 from app.backend.tools.rag_utils import chunk_documents
+from app.backend.utils.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class SummarizationAgent:
@@ -17,6 +21,8 @@ class SummarizationAgent:
     def summarize(self, text: str, instructions: Optional[str] = None) -> str:
         if len(text) <= self.MAP_REDUCE_THRESHOLD:
             return self._summarize_piece(text, instructions)
+
+        logger.info(f"Text length {len(text)} exceeds threshold, using map-reduce summarization.")
 
         pieces = chunk_documents(text, chunk_size=self.MAP_REDUCE_THRESHOLD, chunk_overlap=200)
         partial_summaries = [self._summarize_piece(piece, instructions) for piece in pieces]
@@ -39,6 +45,7 @@ class SummarizationAgent:
         document = self._resolve_document(question, available_documents or [])
 
         if document is None:
+            logger.info("No document resolved for summarization, falling back to question text.")
             return {
                 "summary": self.summarize(question, instructions),
                 "document": None
@@ -47,11 +54,13 @@ class SummarizationAgent:
         text = self.vector_store.get_document_text(document["file_id"])
 
         if not text.strip():
+            logger.warning(f"Resolved document {document['file_name']!r} has no indexed text.")
             return {
                 "summary": self.summarize(question, instructions),
                 "document": None
             }
 
+        logger.info(f"Summarizing resolved document {document['file_name']!r} ({len(text)} chars).")
         return {
             "summary": self.summarize(text, instructions or question),
             "document": document

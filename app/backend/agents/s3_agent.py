@@ -3,7 +3,11 @@ from typing import Any, Dict
 from app.backend.prompts.sql_prompt import SQL_SYSTEM_PROMPT, build_sql_prompt
 from app.backend.services.athena_service import AthenaService
 from app.backend.services.llm_service import LLMService
+from app.backend.utils.logger import get_logger
 from app.backend.utils.validators import is_read_only_sql
+
+
+logger = get_logger(__name__)
 
 
 class S3Agent:
@@ -37,9 +41,11 @@ class S3Agent:
         sql = self.generate_sql(question)
 
         if not is_read_only_sql(sql):
+            logger.warning(f"Rejected unsafe Athena SQL: {sql!r}")
             raise ValueError("Only read-only SELECT queries are allowed.")
 
         rows = self.athena_service.run_query(sql)
+        logger.info(f"Athena query executed, {len(rows)} row(s) returned. sql={sql!r}")
 
         return {
             "sql": sql,

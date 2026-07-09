@@ -1,0 +1,11 @@
+.venv
+.git
+.gitignore
+__pycache__
+**/__pycache__
+*.pyc
+
+# never bake secrets into an image layer — docker-compose injects .env at
+# runtime via env_file, so it doesn't need to be copied in at build time
+.env
+.env.*

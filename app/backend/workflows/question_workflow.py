@@ -7,7 +7,10 @@ from app.backend.graphs.question_graph import question_graph
 from app.backend.services.athena_service import AthenaService
 from app.backend.services.document_store_service import DocumentStore
 from app.backend.services.memory_service import MemoryService
+from app.backend.utils.logger import get_logger
 
+
+logger = get_logger(__name__)
 
 INTERNAL_TABLES = {"documents", "conversation_messages"}
 
@@ -46,6 +49,8 @@ class QuestionWorkflow:
         return "\n".join(f"{turn['role']}: {turn['content']}" for turn in history)
 
     def ask(self, question: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+        logger.info(f"Received question (session_id={session_id!r}): {question!r}")
+
         schema = self._describe_postgres_schema()
         athena_tables = self.athena_service.list_tables()
         document_records = self.document_store.list_indexed_document_records()
@@ -63,6 +68,8 @@ class QuestionWorkflow:
             initial_state["session_id"] = session_id
 
         final_state = question_graph.invoke(initial_state)
+
+        logger.info(f"Answered via route={final_state.get('route')!r} (session_id={session_id!r}).")
 
         return {
             "answer": final_state.get("final_answer"),

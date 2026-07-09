@@ -1,0 +1,14 @@
+[
+  {
+    "question": "What are the main risk factors for patient readmission?",
+    "relevant_chunk_ids": ["REPLACE_WITH_REAL_CHUNK_ID_0", "REPLACE_WITH_REAL_CHUNK_ID_1"]
+  },
+  {
+    "question": "Summarize the key points of the healthcare policy document.",
+    "relevant_chunk_ids": ["REPLACE_WITH_REAL_CHUNK_ID_0"]
+  },
+  {
+    "question": "What lab result thresholds indicate high risk for the patient?",
+    "relevant_chunk_ids": ["REPLACE_WITH_REAL_CHUNK_ID_0", "REPLACE_WITH_REAL_CHUNK_ID_1", "REPLACE_WITH_REAL_CHUNK_ID_2"]
+  }
+]

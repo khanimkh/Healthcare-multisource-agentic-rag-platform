@@ -9,6 +9,10 @@ from app.backend.services.graph_store_service import GraphStoreService
 from app.backend.tools.data_loader import load_document
 from app.backend.tools.entity_extraction import extract_entities_and_relationships
 from app.backend.tools.rag_utils import chunk_documents, create_embeddings_for_chunks
+from app.backend.utils.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class DocumentIngestionWorkflow:
@@ -32,6 +36,8 @@ class DocumentIngestionWorkflow:
 
         file_id = upload_result["file_id"]
         s3_uri = upload_result["s3_uri"]
+
+        logger.info(f"Starting document ingestion for {file_name!r} (file_id={file_id}).")
 
         self.document_store.create_document(
             file_id=file_id,
@@ -87,6 +93,12 @@ class DocumentIngestionWorkflow:
                 document_type=document_type
             )
 
+            logger.info(
+                f"Document {file_name!r} indexed successfully. "
+                f"chunks={len(embedded_chunks)}, entities={len(extraction['entities'])}, "
+                f"relationships={len(extraction['relationships'])}."
+            )
+
             return {
                 "status": "indexed",
                 "file_id": file_id,
@@ -99,6 +111,7 @@ class DocumentIngestionWorkflow:
             }
 
         except Exception as error:
+            logger.error(f"Document ingestion failed for {file_name!r} (file_id={file_id}): {error}")
             self.document_store.update_status(
                 file_id=file_id,
                 status="failed",

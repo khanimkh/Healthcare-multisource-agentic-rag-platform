@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine, Column, String, DateTime, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -90,6 +90,62 @@ class DocumentStore:
 
             return [
                 {"file_id": record.file_id, "file_name": record.file_name}
+                for record in records
+            ]
+        finally:
+            session.close()
+
+    def get_document(self, file_id: str) -> Optional[Dict[str, Any]]:
+        session = self.SessionLocal()
+        try:
+            record = session.query(DocumentRecord).filter_by(file_id=file_id).first()
+
+            if not record:
+                return None
+
+            return {
+                "file_id": record.file_id,
+                "file_name": record.file_name,
+                "s3_uri": record.s3_uri,
+                "document_type": record.document_type,
+                "status": record.status
+            }
+        finally:
+            session.close()
+
+    def delete_document(self, file_id: str) -> bool:
+        session = self.SessionLocal()
+        try:
+            record = session.query(DocumentRecord).filter_by(file_id=file_id).first()
+
+            if not record:
+                return False
+
+            session.delete(record)
+            session.commit()
+            return True
+        finally:
+            session.close()
+
+    def list_all_documents(self) -> List[Dict[str, Any]]:
+        session = self.SessionLocal()
+        try:
+            records = (
+                session.query(DocumentRecord)
+                .order_by(DocumentRecord.uploaded_at.desc())
+                .all()
+            )
+
+            return [
+                {
+                    "file_id": record.file_id,
+                    "file_name": record.file_name,
+                    "document_type": record.document_type,
+                    "status": record.status,
+                    "uploaded_at": record.uploaded_at.isoformat() if record.uploaded_at else None,
+                    "processed_at": record.processed_at.isoformat() if record.processed_at else None,
+                    "error_message": record.error_message
+                }
                 for record in records
             ]
         finally:

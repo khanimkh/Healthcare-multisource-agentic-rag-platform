@@ -5,6 +5,10 @@ from app.backend.prompts.graph_rag_prompt import GRAPH_RAG_SYSTEM_PROMPT, build_
 from app.backend.services.graph_store_service import GraphStoreService
 from app.backend.services.llm_service import LLMService
 from app.backend.tools.entity_extraction import extract_entities_and_relationships
+from app.backend.utils.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class GraphRAGAgent:
@@ -16,6 +20,11 @@ class GraphRAGAgent:
     def answer(self, question: str, k: int = 5, hops: int = 2) -> Dict[str, Any]:
         extraction = extract_entities_and_relationships(question)
         graph_facts = self.graph_store.find_related(extraction["entities"], hops=hops)
+
+        logger.info(
+            f"Found {len(extraction['entities'])} candidate entities and "
+            f"{len(graph_facts)} graph fact(s) for the question."
+        )
 
         chunks = self.rag_agent.retrieve(question=question, k=k)
 

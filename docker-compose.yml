@@ -6,5 +6,34 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      # override whatever POSTGRES_URL/REDIS_URL are set to in .env — inside
+      # this network, the other services are reachable by service name, not
+      # "localhost". Everything else in .env (AWS region, Bedrock model ids,
+      # S3 bucket, OpenSearch host, etc.) still applies as-is.
+      POSTGRES_URL: postgresql://healthcare_rag:healthcare_rag@postgres:5432/healthcare_rag
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - ~/.aws:/root/.aws:ro
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: healthcare_rag
+      POSTGRES_PASSWORD: healthcare_rag
+      POSTGRES_DB: healthcare_rag
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:

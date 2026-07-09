@@ -33,6 +33,13 @@ class AWSStorage:
             "s3_uri": s3_uri
         }
 
+    def delete_file(self, s3_uri: str) -> None:
+        prefix = "s3://"
+        without_prefix = s3_uri[len(prefix):] if s3_uri.startswith(prefix) else s3_uri
+        bucket, _, key = without_prefix.partition("/")
+
+        self.s3.delete_object(Bucket=bucket, Key=key)
+
 
 class OpenSearchVectorStore:
 
@@ -185,6 +192,15 @@ class OpenSearchVectorStore:
             }
             for hit in response["hits"]["hits"]
         ]
+
+    def delete_chunks(self, file_id: str) -> None:
+        if not self.client.indices.exists(index=settings.opensearch_index):
+            return
+
+        self.client.delete_by_query(
+            index=settings.opensearch_index,
+            body={"query": {"term": {"file_id": file_id}}}
+        )
 
     def get_document_text(self, file_id: str) -> str:
         response = self.client.search(

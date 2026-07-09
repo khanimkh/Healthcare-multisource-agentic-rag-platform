@@ -1,0 +1,7 @@
+-r requirements.txt
+
+pytest
+
+# needed for Tier 2 (mocking AWS / Redis) — not used by Tier 1 tests yet
+moto
+fakeredis

@@ -4,6 +4,10 @@ from app.backend.prompts.rag_prompt import RAG_SYSTEM_PROMPT, build_rag_prompt
 from app.backend.services.aws_storage_service import OpenSearchVectorStore
 from app.backend.services.embedding_service import EmbeddingService
 from app.backend.services.llm_service import LLMService
+from app.backend.utils.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class RAGAgent:
@@ -20,11 +24,14 @@ class RAGAgent:
     ) -> List[Dict[str, Any]]:
         embedding = self.embedding_service.create_embedding(question)
 
-        return self.vector_store.search_chunks(
+        chunks = self.vector_store.search_chunks(
             embedding=embedding,
             k=k,
             document_type=document_type
         )
+
+        logger.info(f"Retrieved {len(chunks)} chunk(s) for k={k}.")
+        return chunks
 
     def answer(
         self,

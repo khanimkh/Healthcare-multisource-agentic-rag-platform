@@ -6,6 +6,10 @@ from app.backend.prompts.classification_prompt import (
     build_structured_classification_prompt
 )
 from app.backend.services.llm_service import LLMService
+from app.backend.utils.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class ClassificationAgent:
@@ -22,7 +26,9 @@ class ClassificationAgent:
             temperature=0
         )
 
-        return category.strip().lower()
+        category = category.strip().lower()
+        logger.info(f"Classified document as {category!r}.")
+        return category
 
     def classify_structured_data(self, df: pd.DataFrame) -> str:
         prompt = build_structured_classification_prompt(df.columns.tolist())
@@ -34,4 +40,6 @@ class ClassificationAgent:
             temperature=0
         )
 
-        return category.strip().lower()
+        category = category.strip().lower()
+        logger.info(f"Classified structured dataset as {category!r}.")
+        return category

@@ -7,6 +7,10 @@ from app.backend.services.document_store_service import DocumentStore
 from app.backend.services.glue_catalog_service import GlueCatalog
 from app.backend.tools.data_loader import load_csv
 from app.backend.config.settings import settings
+from app.backend.utils.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class StructuredIngestionWorkflow:
@@ -29,6 +33,8 @@ class StructuredIngestionWorkflow:
 
         file_id = upload_result["file_id"]
         s3_uri = upload_result["s3_uri"]
+
+        logger.info(f"Starting structured ingestion for {file_name!r} (file_id={file_id}).")
 
         self.document_store.create_document(
             file_id=file_id,
@@ -61,6 +67,11 @@ class StructuredIngestionWorkflow:
                 document_type=document_type
             )
 
+            logger.info(
+                f"Structured dataset {file_name!r} registered successfully. "
+                f"table={table_name}, rows={len(df)}."
+            )
+
             return {
                 "status": "registered",
                 "file_id": file_id,
@@ -74,6 +85,7 @@ class StructuredIngestionWorkflow:
             }
 
         except Exception as error:
+            logger.error(f"Structured ingestion failed for {file_name!r} (file_id={file_id}): {error}")
             self.document_store.update_status(
                 file_id=file_id,
                 status="failed",
