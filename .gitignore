@@ -73,5 +73,4 @@ app/backend/data/outputs/*
 Thumbs.db
 
 # Temporary ignore
-README.md
 test-methods.md
