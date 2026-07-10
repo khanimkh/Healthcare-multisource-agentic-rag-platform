@@ -6,6 +6,7 @@ from app.backend.config.settings import settings
 from app.backend.prompts.sql_prompt import SQL_SYSTEM_PROMPT, build_sql_prompt
 from app.backend.services.llm_service import LLMService
 from app.backend.utils.logger import get_logger
+from app.backend.utils.sql_cleanup import clean_sql_response
 from app.backend.utils.validators import is_read_only_sql
 
 
@@ -31,7 +32,7 @@ class SQLAgent:
             temperature=0
         )
 
-        return sql.strip().strip("`").strip()
+        return clean_sql_response(sql)
 
     def execute(self, sql: str) -> List[Dict[str, Any]]:
         if not is_read_only_sql(sql):

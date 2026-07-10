@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -17,5 +17,7 @@ class UploadResponse(BaseModel):
 
     glue_database: Optional[str] = None
     glue_table: Optional[str] = None
+    postgres_table: Optional[str] = None
     rows: Optional[int] = None
     columns: Optional[List[str]] = None
+    sample_rows: Optional[List[Dict[str, Any]]] = None

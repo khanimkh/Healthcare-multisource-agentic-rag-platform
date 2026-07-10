@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Dict, Any
 
@@ -5,6 +6,7 @@ from app.backend.agents.classification_agent import ClassificationAgent
 from app.backend.services.aws_storage_service import AWSStorage
 from app.backend.services.document_store_service import DocumentStore
 from app.backend.services.glue_catalog_service import GlueCatalog
+from app.backend.services.relational_store_service import RelationalDataStore
 from app.backend.tools.data_loader import load_csv
 from app.backend.config.settings import settings
 from app.backend.utils.logger import get_logger
@@ -19,6 +21,7 @@ class StructuredIngestionWorkflow:
         self.document_store = DocumentStore()
         self.glue_catalog = GlueCatalog()
         self.classification_agent = ClassificationAgent()
+        self.relational_store = RelationalDataStore()
 
     def ingest_csv(
         self,
@@ -61,6 +64,11 @@ class StructuredIngestionWorkflow:
                 df=df
             )
 
+            postgres_table = self.relational_store.load_dataframe(
+                dataset_name=dataset_name,
+                df=df
+            )
+
             self.document_store.update_status(
                 file_id=file_id,
                 status="registered",
@@ -69,8 +77,10 @@ class StructuredIngestionWorkflow:
 
             logger.info(
                 f"Structured dataset {file_name!r} registered successfully. "
-                f"table={table_name}, rows={len(df)}."
+                f"glue_table={table_name}, postgres_table={postgres_table}, rows={len(df)}."
             )
+
+            sample_rows = json.loads(df.head(5).to_json(orient="records"))
 
             return {
                 "status": "registered",
@@ -80,8 +90,10 @@ class StructuredIngestionWorkflow:
                 "document_type": document_type,
                 "glue_database": settings.glue_database_name,
                 "glue_table": table_name,
+                "postgres_table": postgres_table,
                 "rows": len(df),
-                "columns": list(df.columns)
+                "columns": list(df.columns),
+                "sample_rows": sample_rows
             }
 
         except Exception as error:

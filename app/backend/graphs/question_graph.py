@@ -93,12 +93,15 @@ def run_summarization(state: QuestionState) -> QuestionState:
 
 
 def run_classification(state: QuestionState) -> QuestionState:
-    category = classification_agent.classify_document(text=state["question"])
+    result = classification_agent.classify_uploaded_document(
+        question=state["question"],
+        available_documents=state.get("available_document_records")
+    )
 
     return {
         **state,
-        "tool_answer": category,
-        "sources": []
+        "tool_answer": result["category"],
+        "sources": [result["document"]] if result.get("document") else []
     }
 
 

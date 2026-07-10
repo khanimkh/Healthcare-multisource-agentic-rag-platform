@@ -8,11 +8,13 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from app.backend.schemas.document_schema import DocumentRecordResponse
 from app.backend.schemas.question_schema import QuestionRequest, QuestionResponse
 from app.backend.schemas.upload_schema import UploadResponse
+from app.backend.schemas.visualization_schema import ChartRequest, ChartResponse, ChartSuggestionsResponse
 from app.backend.services.document_store_service import DocumentStore
 from app.backend.tools.data_loader import detect_file_type
 from app.backend.workflows.document_ingestion_workflow import DocumentIngestionWorkflow
 from app.backend.workflows.question_workflow import QuestionWorkflow
 from app.backend.workflows.structured_ingestion_workflow import StructuredIngestionWorkflow
+from app.backend.workflows.visualization_workflow import VisualizationWorkflow
 from app.backend.utils.logger import get_logger
 
 
@@ -23,6 +25,7 @@ router = APIRouter()
 document_ingestion_workflow = DocumentIngestionWorkflow()
 structured_ingestion_workflow = StructuredIngestionWorkflow()
 question_workflow = QuestionWorkflow()
+visualization_workflow = VisualizationWorkflow()
 document_store = DocumentStore()
 
 
@@ -122,4 +125,29 @@ async def ask_question(request: QuestionRequest):
 
     except Exception as e:
         logger.error(f"Ask failed for question={request.question!r}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/visualizations/suggestions", response_model=ChartSuggestionsResponse)
+async def get_chart_suggestions():
+    try:
+        questions = visualization_workflow.suggest()
+        return ChartSuggestionsResponse(questions=questions)
+
+    except Exception as e:
+        logger.error(f"Failed to generate chart suggestions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/visualizations", response_model=ChartResponse)
+async def generate_chart(request: ChartRequest):
+    try:
+        result = visualization_workflow.chart(question=request.question)
+        return ChartResponse(**result)
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    except Exception as e:
+        logger.error(f"Failed to generate chart for question={request.question!r}: {e}")
         raise HTTPException(status_code=500, detail=str(e))

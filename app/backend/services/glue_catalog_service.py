@@ -1,20 +1,15 @@
-import re
 from typing import Dict
 
 import boto3
 import pandas as pd
 
 from app.backend.config.settings import settings
+from app.backend.utils.naming import normalize_table_name
 
 
 class GlueCatalog:
     def __init__(self):
         self.client = boto3.client("glue", region_name=settings.aws_region)
-
-    def _normalize_table_name(self, name: str) -> str:
-        name = name.lower()
-        name = re.sub(r"[^a-z0-9_]", "_", name)
-        return name.strip("_")
 
     def _map_dtype_to_glue(self, dtype) -> str:
         dtype = str(dtype)
@@ -51,11 +46,11 @@ class GlueCatalog:
     ) -> str:
         self.ensure_database_exists()
 
-        table_name = self._normalize_table_name(dataset_name)
+        table_name = normalize_table_name(dataset_name)
 
         columns = [
             {
-                "Name": self._normalize_table_name(column),
+                "Name": normalize_table_name(column),
                 "Type": self._map_dtype_to_glue(dtype)
             }
             for column, dtype in df.dtypes.items()

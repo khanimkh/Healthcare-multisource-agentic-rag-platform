@@ -1,9 +1,9 @@
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.backend.prompts.summary_prompt import SUMMARY_SYSTEM_PROMPT, build_summary_prompt
 from app.backend.services.aws_storage_service import OpenSearchVectorStore
 from app.backend.services.llm_service import LLMService
+from app.backend.tools.document_resolution import resolve_document
 from app.backend.tools.rag_utils import chunk_documents
 from app.backend.utils.logger import get_logger
 
@@ -42,7 +42,7 @@ class SummarizationAgent:
         available_documents: Optional[List[Dict[str, str]]] = None,
         instructions: Optional[str] = None
     ) -> Dict[str, Any]:
-        document = self._resolve_document(question, available_documents or [])
+        document = resolve_document(question, available_documents or [])
 
         if document is None:
             logger.info("No document resolved for summarization, falling back to question text.")
@@ -65,30 +65,6 @@ class SummarizationAgent:
             "summary": self.summarize(text, instructions or question),
             "document": document
         }
-
-    def _resolve_document(
-        self,
-        question: str,
-        available_documents: List[Dict[str, str]]
-    ) -> Optional[Dict[str, str]]:
-        question_lower = question.lower()
-        best_document = None
-        best_score = 0.0
-
-        for document in available_documents:
-            stem = Path(document["file_name"]).stem.lower().replace("_", " ").replace("-", " ")
-            words = [word for word in stem.split() if len(word) > 2]
-
-            if not words:
-                continue
-
-            score = sum(1 for word in words if word in question_lower) / len(words)
-
-            if score > best_score:
-                best_score = score
-                best_document = document
-
-        return best_document if best_score >= 0.5 else None
 
     def _summarize_piece(self, text: str, instructions: Optional[str]) -> str:
         prompt = build_summary_prompt(text=text, instructions=instructions)

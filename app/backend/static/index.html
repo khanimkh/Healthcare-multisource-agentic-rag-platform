@@ -184,10 +184,18 @@
   }
   .dropzone.drag-over { background: var(--accent-soft); border-color: var(--accent); opacity: 1; }
   .dropzone input { display: none; }
-  #upload-result { padding: 0 1.1rem 1.1rem; font-size: .85rem; }
+  #upload-result { padding: 0 1.1rem; font-size: .85rem; }
+  .upload-item { padding: .8rem 0; border-bottom: 1px solid var(--border); }
+  .upload-item:last-child { border-bottom: none; }
   .result-grid { display: grid; grid-template-columns: auto 1fr; gap: .3rem .8rem; margin-top: .6rem; }
   .result-grid dt { opacity: .6; }
   .result-grid dd { margin: 0; word-break: break-word; }
+
+  .table-wrap { overflow-x: auto; margin-top: .5rem; border: 1px solid var(--border); border-radius: 6px; }
+  .preview-table { border-collapse: collapse; font-size: .78rem; white-space: nowrap; width: 100%; }
+  .preview-table th, .preview-table td { padding: .35rem .55rem; border-bottom: 1px solid var(--border); text-align: left; }
+  .preview-table th { background: var(--surface); }
+  .preview-table tr:last-child td { border-bottom: none; }
 
   .doc-list-header {
     display: flex;
@@ -234,6 +242,27 @@
   .status-indexed, .status-registered { background: color-mix(in srgb, seagreen 25%, transparent); color: seagreen; }
   .status-failed { background: color-mix(in srgb, crimson 20%, transparent); color: crimson; }
 
+  .chart-title { font-size: .8rem; opacity: .7; margin: 1rem 0 .4rem; text-transform: uppercase; letter-spacing: .03em; }
+  .chart-title:first-child { margin-top: 0; }
+
+  .insights-explore { padding: 1rem 1.1rem; }
+  .insights-explore select, .insights-explore input[type="text"] {
+    font: inherit;
+    padding: .55rem .7rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: inherit;
+  }
+  .chart-controls-row { display: flex; gap: .5rem; margin-bottom: .5rem; }
+  .chart-controls-row select { flex: 1; min-width: 0; }
+  .chart-query-row { display: flex; gap: .5rem; }
+  .chart-query-row input[type="text"] { flex: 1; }
+  #chart-result { margin-top: .9rem; }
+  .chart-legend { display: flex; flex-direction: column; justify-content: center; gap: .2rem; }
+  .chart-legend-row { display: flex; align-items: center; gap: .4rem; font-size: .78rem; }
+  .chart-legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+
   .spinner {
     width: 14px;
     height: 14px;
@@ -260,6 +289,7 @@
   <nav class="tabs">
     <button class="tab-btn active" id="tab-btn-ask" data-tab="ask" type="button">Ask</button>
     <button class="tab-btn" id="tab-btn-upload" data-tab="upload" type="button">Upload</button>
+    <button class="tab-btn" id="tab-btn-insights" data-tab="insights" type="button">Insights</button>
   </nav>
 
   <section id="panel-ask" class="tab-panel card active">
@@ -272,10 +302,10 @@
   </section>
 
   <section id="panel-upload" class="tab-panel card">
-    <h2>Upload a document or dataset</h2>
+    <h2>Upload documents or datasets</h2>
     <label class="dropzone" id="dropzone">
-      <span id="dropzone-label">Drag a file here, or click to choose one</span>
-      <input type="file" id="file-input">
+      <span id="dropzone-label">Drag files here, or click to choose (multiple allowed)</span>
+      <input type="file" id="file-input" multiple>
     </label>
     <div id="upload-result"></div>
 
@@ -284,6 +314,29 @@
       <button class="ghost" id="refresh-docs-btn" type="button">Refresh</button>
     </div>
     <div id="document-list"></div>
+  </section>
+
+  <section id="panel-insights" class="tab-panel card">
+    <h2>Document insights</h2>
+
+    <div class="insights-explore">
+      <h3 class="chart-title">Explore your data</h3>
+      <div class="chart-controls-row">
+        <select id="chart-suggestions">
+          <option value="">Loading suggestions…</option>
+        </select>
+        <select id="chart-type-select">
+          <option value="bar">Bar chart</option>
+          <option value="pie">Pie chart</option>
+          <option value="line">Line chart</option>
+        </select>
+      </div>
+      <div class="chart-query-row">
+        <input type="text" id="chart-question-input" placeholder="e.g. Number of patients by diagnosis">
+        <button class="primary" id="generate-chart-btn" type="button">Generate chart</button>
+      </div>
+      <div id="chart-result"></div>
+    </div>
   </section>
 
 <script>
@@ -337,6 +390,7 @@
       btn.classList.add('active');
       document.getElementById(`panel-${btn.dataset.tab}`).classList.add('active');
       if (btn.dataset.tab === 'upload') loadDocuments();
+      if (btn.dataset.tab === 'insights') loadChartSuggestions();
     });
   });
 
@@ -433,16 +487,60 @@
     e.preventDefault();
     if (e.dataTransfer.files.length) {
       fileInput.files = e.dataTransfer.files;
-      uploadFile(fileInput.files[0]);
+      uploadFiles(e.dataTransfer.files);
     }
   });
   fileInput.addEventListener('change', () => {
-    if (fileInput.files.length) uploadFile(fileInput.files[0]);
+    if (fileInput.files.length) uploadFiles(fileInput.files);
   });
 
+  function renderUploadResult(data) {
+    const hasPreview = data.sample_rows && data.sample_rows.length;
+    const skipKeys = new Set(hasPreview ? ['sample_rows', 'columns'] : ['sample_rows']);
+
+    const gridRows = Object.entries(data)
+      .filter(([k, v]) => !skipKeys.has(k) && v !== null && v !== undefined)
+      .map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(Array.isArray(v) ? v.join(', ') : v)}</dd>`)
+      .join('');
+
+    let html = `<p>✅ Uploaded successfully</p><dl class="result-grid">${gridRows}</dl>`;
+
+    if (hasPreview) {
+      const columns = data.columns || Object.keys(data.sample_rows[0]);
+      const headerHtml = columns.map(c => `<th>${escapeHtml(c)}</th>`).join('');
+      const bodyHtml = data.sample_rows.map(row =>
+        `<tr>${columns.map(c => `<td>${escapeHtml(row[c])}</td>`).join('')}</tr>`
+      ).join('');
+
+      html += `
+        <p class="muted" style="margin-top:.75rem">Preview (first ${data.sample_rows.length} rows):</p>
+        <div class="table-wrap"><table class="preview-table"><thead><tr>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table></div>
+      `;
+    }
+
+    return html;
+  }
+
+  async function uploadFiles(fileList) {
+    const files = Array.from(fileList);
+    if (!files.length) return;
+
+    dropzoneLabel.textContent = files.length === 1 ? files[0].name : `${files.length} files selected`;
+    uploadResult.innerHTML = '';
+
+    for (const file of files) {
+      await uploadFile(file);
+    }
+
+    fileInput.value = '';
+    loadDocuments();
+  }
+
   async function uploadFile(file) {
-    dropzoneLabel.textContent = file.name;
-    uploadResult.innerHTML = '<p><span class="spinner"></span>Uploading and processing…</p>';
+    const block = document.createElement('div');
+    block.className = 'upload-item';
+    block.innerHTML = `<p><span class="spinner"></span>Uploading ${escapeHtml(file.name)}…</p>`;
+    uploadResult.appendChild(block);
 
     const formData = new FormData();
     formData.append('file', file);
@@ -452,20 +550,13 @@
       const data = await response.json();
 
       if (!response.ok) {
-        uploadResult.innerHTML = `<p style="color:crimson">${escapeHtml(data.detail || 'Upload failed')}</p>`;
+        block.innerHTML = `<p style="color:crimson">${escapeHtml(file.name)}: ${escapeHtml(data.detail || 'Upload failed')}</p>`;
         return;
       }
 
-      const rows = Object.entries(data)
-        .filter(([, v]) => v !== null && v !== undefined)
-        .map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(Array.isArray(v) ? v.join(', ') : v)}</dd>`)
-        .join('');
-      uploadResult.innerHTML = `<p>✅ Uploaded successfully</p><dl class="result-grid">${rows}</dl>`;
+      block.innerHTML = renderUploadResult(data);
     } catch (err) {
-      uploadResult.innerHTML = `<p style="color:crimson">${escapeHtml(err.message)}</p>`;
-    } finally {
-      fileInput.value = '';
-      loadDocuments();
+      block.innerHTML = `<p style="color:crimson">${escapeHtml(file.name)}: ${escapeHtml(err.message)}</p>`;
     }
   }
 
@@ -547,6 +638,214 @@
   });
 
   refreshDocsBtn.addEventListener('click', loadDocuments);
+
+  // ---- Chart explorer (dependency-free inline SVG bar/pie/line charts) ----
+  const CHART_COLORS = ['#2563eb', '#16a34a', '#f59e0b', '#dc2626', '#7c3aed', '#0891b2', '#db2777', '#65a30d'];
+
+  function truncateLabel(label, max = 12) {
+    return String(label).length > max ? String(label).slice(0, max - 1) + '…' : label;
+  }
+
+  function renderYAxisTitle(label, paddingLeft, paddingTop, chartHeight) {
+    if (!label) return '';
+    const cy = paddingTop + chartHeight / 2;
+    return `<text x="10" y="${cy}" font-size="9" fill="currentColor" text-anchor="middle" transform="rotate(-90 10 ${cy})">${escapeHtml(label)}</text>`;
+  }
+
+  function renderBarChart(data, { width = 360, height = 190, color = 'var(--accent)', yAxisLabel = 'Value' } = {}) {
+    if (!data.length) return '<p class="muted">No data yet.</p>';
+
+    const max = Math.max(...data.map(d => d.value), 1);
+    const gap = 8;
+    const paddingTop = 20;
+    const paddingBottom = 34;
+    const paddingLeft = yAxisLabel ? 26 : 6;
+    const chartHeight = height - paddingTop - paddingBottom;
+    const chartWidth = width - paddingLeft - 6;
+    const barWidth = (chartWidth - gap * (data.length - 1)) / data.length;
+
+    const bars = data.map((d, i) => {
+      const barHeight = (d.value / max) * chartHeight;
+      const x = paddingLeft + i * (barWidth + gap);
+      const y = paddingTop + (chartHeight - barHeight);
+
+      return `
+        <text x="${x + barWidth / 2}" y="${y - 4}" font-size="10" text-anchor="middle" fill="currentColor">${d.value}</text>
+        <rect x="${x}" y="${y}" width="${barWidth}" height="${Math.max(barHeight, 1)}" fill="${color}" rx="3"></rect>
+        <text x="${x + barWidth / 2}" y="${paddingTop + chartHeight + 14}" font-size="9" text-anchor="middle" fill="currentColor">${escapeHtml(truncateLabel(d.label))}</text>
+      `;
+    }).join('');
+
+    const axis = `<line x1="${paddingLeft}" y1="${paddingTop}" x2="${paddingLeft}" y2="${paddingTop + chartHeight}" stroke="currentColor" stroke-opacity=".3"></line>`;
+
+    return `<svg viewBox="0 0 ${width} ${height}" style="width:100%;max-width:${width}px;height:auto">${axis}${renderYAxisTitle(yAxisLabel, paddingLeft, paddingTop, chartHeight)}${bars}</svg>`;
+  }
+
+  function renderLineChart(data, { width = 360, height = 190, color = 'var(--accent)', yAxisLabel = 'Value' } = {}) {
+    if (!data.length) return '<p class="muted">No data yet.</p>';
+
+    const max = Math.max(...data.map(d => d.value), 1);
+    const paddingTop = 20;
+    const paddingBottom = 34;
+    const paddingLeft = yAxisLabel ? 26 : 6;
+    const chartHeight = height - paddingTop - paddingBottom;
+    const chartWidth = width - paddingLeft - 6;
+    const stepX = data.length > 1 ? chartWidth / (data.length - 1) : 0;
+
+    const points = data.map((d, i) => ({
+      x: paddingLeft + i * stepX,
+      y: paddingTop + chartHeight - (d.value / max) * chartHeight,
+      d
+    }));
+
+    const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x},${p.y}`).join(' ');
+
+    const dots = points.map(p => `
+      <text x="${p.x}" y="${p.y - 8}" font-size="10" text-anchor="middle" fill="currentColor">${p.d.value}</text>
+      <circle cx="${p.x}" cy="${p.y}" r="3.5" fill="${color}"></circle>
+      <text x="${p.x}" y="${paddingTop + chartHeight + 14}" font-size="9" text-anchor="middle" fill="currentColor">${escapeHtml(truncateLabel(p.d.label))}</text>
+    `).join('');
+
+    const axis = `<line x1="${paddingLeft}" y1="${paddingTop}" x2="${paddingLeft}" y2="${paddingTop + chartHeight}" stroke="currentColor" stroke-opacity=".3"></line>`;
+
+    return `<svg viewBox="0 0 ${width} ${height}" style="width:100%;max-width:${width}px;height:auto">
+      ${axis}${renderYAxisTitle(yAxisLabel, paddingLeft, paddingTop, chartHeight)}
+      <path d="${pathD}" fill="none" stroke="${color}" stroke-width="2"></path>
+      ${dots}
+    </svg>`;
+  }
+
+  function renderPieChart(data, { size = 200 } = {}) {
+    if (!data.length) return '<p class="muted">No data yet.</p>';
+
+    const total = data.reduce((sum, d) => sum + d.value, 0) || 1;
+    const radius = size / 2 - 14;
+    const center = size / 2;
+    const circumference = 2 * Math.PI * radius;
+
+    let offset = 0;
+    const segments = data.map((d, i) => {
+      const fraction = d.value / total;
+      const dash = fraction * circumference;
+      const circle = `<circle cx="${center}" cy="${center}" r="${radius}" fill="none" stroke="${CHART_COLORS[i % CHART_COLORS.length]}" stroke-width="26" stroke-dasharray="${dash} ${circumference - dash}" stroke-dashoffset="${-offset}" transform="rotate(-90 ${center} ${center})"></circle>`;
+      offset += dash;
+      return circle;
+    }).join('');
+
+    const legend = data.map((d, i) => `
+      <div class="chart-legend-row">
+        <span class="chart-legend-swatch" style="background:${CHART_COLORS[i % CHART_COLORS.length]}"></span>
+        ${escapeHtml(truncateLabel(d.label, 24))} — ${d.value} (${Math.round(d.value / total * 100)}%)
+      </div>
+    `).join('');
+
+    return `
+      <div style="display:flex;gap:1.2rem;align-items:center;flex-wrap:wrap">
+        <svg viewBox="0 0 ${size} ${size}" style="width:${size}px;max-width:100%;height:auto;flex-shrink:0">${segments}</svg>
+        <div class="chart-legend">${legend}</div>
+      </div>
+    `;
+  }
+
+  function renderChart(data, type, opts = {}) {
+    if (type === 'pie') return renderPieChart(data, opts);
+    if (type === 'line') return renderLineChart(data, opts);
+    return renderBarChart(data, opts);
+  }
+
+  // ---- Chart explorer (ask a question about your data, get a chart) ----
+  const chartSuggestionsSelect = document.getElementById('chart-suggestions');
+  const chartTypeSelect = document.getElementById('chart-type-select');
+  const chartQuestionInput = document.getElementById('chart-question-input');
+  const generateChartBtn = document.getElementById('generate-chart-btn');
+  const chartResult = document.getElementById('chart-result');
+  let lastChartResult = null;
+
+  async function loadChartSuggestions() {
+    chartSuggestionsSelect.innerHTML = '<option value="">Loading suggestions…</option>';
+
+    try {
+      const response = await fetch('/visualizations/suggestions');
+      const data = await response.json();
+
+      if (!response.ok || !data.questions || !data.questions.length) {
+        chartSuggestionsSelect.innerHTML = '<option value="">No suggestions yet — upload structured data first</option>';
+        return;
+      }
+
+      chartSuggestionsSelect.innerHTML = '<option value="">Choose a suggested question…</option>' +
+        data.questions.map(q => `<option value="${escapeHtml(q)}">${escapeHtml(q)}</option>`).join('');
+    } catch (err) {
+      chartSuggestionsSelect.innerHTML = '<option value="">Failed to load suggestions</option>';
+    }
+  }
+
+  chartSuggestionsSelect.addEventListener('change', () => {
+    if (chartSuggestionsSelect.value) {
+      chartQuestionInput.value = chartSuggestionsSelect.value;
+      generateChart(chartSuggestionsSelect.value);
+    }
+  });
+
+  generateChartBtn.addEventListener('click', () => {
+    const question = chartQuestionInput.value.trim();
+    if (question) generateChart(question);
+  });
+
+  chartQuestionInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      generateChartBtn.click();
+    }
+  });
+
+  chartTypeSelect.addEventListener('change', () => {
+    if (lastChartResult) renderChartResult();
+  });
+
+  function renderChartResult() {
+    if (!lastChartResult || !lastChartResult.labels || !lastChartResult.labels.length) {
+      chartResult.innerHTML = '<p class="muted">No data found for that question.</p>';
+      return;
+    }
+
+    const chartData = lastChartResult.labels.map((label, i) => ({ label, value: lastChartResult.values[i] }));
+
+    chartResult.innerHTML = `
+      <h3 class="chart-title">${escapeHtml(lastChartResult.title)}</h3>
+      ${renderChart(chartData, chartTypeSelect.value, { color: 'darkorange' })}
+      ${lastChartResult.sql ? `<pre><code>${escapeHtml(lastChartResult.sql)}</code></pre>` : ''}
+    `;
+  }
+
+  async function generateChart(question) {
+    generateChartBtn.disabled = true;
+    chartResult.innerHTML = '<p class="muted"><span class="spinner"></span>Generating chart…</p>';
+
+    try {
+      const response = await fetch('/visualizations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question })
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        lastChartResult = null;
+        chartResult.innerHTML = `<p style="color:crimson">${escapeHtml(data.detail || 'Failed to generate chart')}</p>`;
+        return;
+      }
+
+      lastChartResult = data;
+      renderChartResult();
+    } catch (err) {
+      lastChartResult = null;
+      chartResult.innerHTML = `<p style="color:crimson">${escapeHtml(err.message)}</p>`;
+    } finally {
+      generateChartBtn.disabled = false;
+    }
+  }
 </script>
 </body>
 </html>
