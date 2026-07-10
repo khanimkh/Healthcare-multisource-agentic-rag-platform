@@ -76,172 +76,56 @@ monitoring search latency
 shards/replicas tuning
 ```
 
-Your current code indexes one chunk at a time:
-
-```python
-self.client.index(...)
-```
-
-For many files, professional code usually uses **bulk indexing**.
+For many files, professional code usually uses **bulk indexing** instead of indexing one chunk at a time.
 
 ---------------
 
-## Your current code uses **single indexing**
+## Your current code already uses **bulk indexing**
 
-Look at the loop:
+This project's `OpenSearchVectorStore.index_chunks()` (in `app/backend/services/aws_storage_service.py`) builds a list of index actions in memory, one per chunk, and sends them all to OpenSearch in a single `helpers.bulk()` call instead of looping over `self.client.index()`:
 
 ```python
-for chunk in chunks:
-	body = {
+actions = []
+
+for chunk_index, chunk in enumerate(chunks):
+	chunk_id = f"{file_id}_{chunk_index}"
+
+	document = {
 		"text": chunk["text"],
+		"file_id": file_id,
+		"chunk_id": chunk_id,
+		"chunk_index": chunk_index,
 		"file_name": file_name,
 		"document_type": document_type,
+		"s3_uri": s3_uri,
+		"uploaded_at": uploaded_at,
+		"metadata": metadata,
 		"embedding": chunk["embedding"],
 	}
-	self.client.index(
-		index=settings.opensearch_index,
-		body=body,
-	)
+
+	actions.append({
+		"_op_type": "index",
+		"_index": settings.opensearch_index,
+		"_id": chunk_id,
+		"_source": document,
+	})
+
+helpers.bulk(self.client, actions, chunk_size=batch_size)
 ```
 
-Notice that `self.client.index()` is called **inside the loop**.
+In practice this means: for a document with 500 chunks, the app makes roughly `500 / batch_size` bulk requests (with the default `batch_size=500`, that's a single request) instead of 500 separate ones — the exact shape recommended above. A few details worth calling out:
 
-That means:
-
-```text
-Chunk 1
-   │
-   ▼
-OpenSearch request #1
-
-Chunk 2
-   │
-   ▼
-OpenSearch request #2
-
-Chunk 3
-   │
-   ▼
-OpenSearch request #3
-
-Chunk 4
-   │
-   ▼
-OpenSearch request #4
-```
-
-If your document has 500 chunks, your application sends:
-
-```text
-500 separate HTTP requests
-```
-
-to OpenSearch.
-
-This is called **single indexing** (or one document per request).
+- **Deterministic `_id`** — each chunk's OpenSearch document ID is `f"{file_id}_{chunk_index}"` rather than an auto-generated ID. This makes re-indexing the same file idempotent: re-running ingestion overwrites the same documents instead of creating duplicates.
+- **`chunk_size` batching** — `helpers.bulk()`'s `chunk_size` parameter (wired to the `batch_size` argument, default 500) caps how many actions go in one HTTP request, so a single very large document doesn't produce one unbounded request; it's split into multiple bulk requests of at most `chunk_size` actions each.
+- **Where it's called from** — `DocumentIngestionWorkflow` calls `index_chunks()` once per uploaded document with that document's full chunk list, so bulk indexing happens per upload, not across uploads. Batching many separate uploads into one bulk call is a further optimization this project doesn't do, since ingestion is triggered per-file as users upload.
 
 ---
 
-# Why is this slower?
+# Why does bulk indexing matter?
 
-Every request has overhead.
+Without it, every chunk means a separate request: Python has to build the request, authenticate with AWS, send it over the network, and wait for OpenSearch's response — one full round trip per chunk. At roughly 20ms overhead per request, a 500-chunk document would cost about 10 seconds just in request overhead, most of which is network/auth overhead rather than actual storage time.
 
-For every chunk, Python has to:
-
-1. Create an HTTP request
-2. Authenticate with AWS
-3. Send it over the network
-4. Wait for OpenSearch
-5. Receive the response
-6. Repeat for the next chunk
-
-Suppose one request takes only **20 milliseconds**.
-
-For 500 chunks:
-
-```text
-20 ms × 500 = 10 seconds
-```
-
-Most of that time is spent sending requests, not storing data.
-
----
-
-# What is Bulk Indexing?
-
-Instead of sending 500 requests,
-
-you send **one request containing 500 documents**.
-
-Like this:
-
-```text
-Chunk 1
-Chunk 2
-Chunk 3
-...
-Chunk 500
-	│
-	▼
-One Bulk Request
-	│
-	▼
-OpenSearch
-```
-
-Instead of:
-
-```text
-500 HTTP requests
-```
-
-you send:
-
-```text
-1 HTTP request
-```
-
-(or maybe a few large ones).
-
-This is much faster.
-
----
-
-# How does professional code look?
-
-Instead of:
-
-```python
-for chunk in chunks:
-	self.client.index(...)
-```
-
-you first build a list.
-
-Imagine:
-
-```python
-actions = [
-	{
-		"_index": "healthcare_documents",
-		"_source": {...},
-	},
-	{
-		"_index": "healthcare_documents",
-		"_source": {...},
-	},
-	{
-		"_index": "healthcare_documents",
-		"_source": {...},
-	},
-]
-```
-
-Then call:
-
-```python
-helpers.bulk(client, actions)
-```
+Bulk indexing collapses that into one request carrying many documents at once (`Chunk 1 ... Chunk 500 → One Bulk Request → OpenSearch`), which is why the current implementation batches all of a document's chunks into a single `helpers.bulk()` call instead of calling `self.client.index()` per chunk.
 
 ---------------
 

@@ -1,9 +1,38 @@
-> **Outdated**: `services/bedrock_service.py` has been removed. This walkthrough describes its original design, where `BedrockService` owned the raw `boto3` `bedrock-runtime` client directly and called `self.client.invoke_model(...)` itself. That responsibility now belongs solely to `services/model_service.py` (see `docs/model-service.md` and the "AI service layering" section of `docs/design-code-general-structure.md`). Classification moved to `agents/classification_agent.py` (via `LLMService` + `prompts/classification_prompt.py`); embeddings moved to `services/embedding_service.py`. Kept here for the general explanation of the Bedrock request/response shape (`invoke_model`, request body, parsing), which is still accurate for `model_service.py`.
+> **This doc matches the current code** in `app/backend/services/model_service.py`, `app/backend/services/llm_service.py`, and `app/backend/services/embedding_service.py`. The responsibilities of a BedrockService were split into three layers (see "Where is this used?" below and the "AI service layering" section of `docs/design-code-general-structure.md`).
 
-1. Use an LLM (Claude on Bedrock) to classify healthcare documents.
+1. Use an LLM (Claude on Bedrock) to generate text — classification, summarization, SQL generation, RAG answers, reranking, routing, and more.
 2. Use an embedding model (Titan Embeddings) to convert text into vectors for semantic search.
 
 Let's go through it section by section.
+
+---
+
+# The three-layer split
+
+Instead of one class that both owns the raw AWS client and knows about every use case, the project splits this into three layers:
+
+```text
+Agents (ClassificationAgent, SummarizationAgent, SQLAgent,
+        ChartAgent, RAGAgent, RouterAgent, FinalAnswerAgent,
+        GraphRAGAgent, S3Agent, ...)
+        │
+        ▼
+LLMService.generate()          EmbeddingService.create_embedding()
+        │                               │
+        ▼                               ▼
+ModelService.invoke_text_model()   ModelService.invoke_embedding_model()
+        │                               │
+        └───────────────┬───────────────┘
+                         ▼
+              boto3 bedrock-runtime client
+                         │
+                         ▼
+                    AWS Bedrock
+```
+
+- **`ModelService`** is the *only* place in the project that holds a `boto3.client("bedrock-runtime")` and calls `invoke_model(...)` directly — the "single owner of the raw client" principle used throughout this codebase.
+- **`LLMService`** and **`EmbeddingService`** are thin, use-case-agnostic wrappers around `ModelService`. Every agent in the project calls one of these two, never `ModelService` directly.
+- Agents don't know anything about Bedrock's request/response shape, model IDs, or `boto3` — they just call `self.llm_service.generate(prompt=..., system_prompt=...)` or `self.embedding_service.create_embedding(text)`.
 
 ---
 
@@ -39,40 +68,21 @@ json.dumps(body)
 import boto3
 ```
 
-`boto3` is the official AWS SDK for Python.
-
-It allows Python code to communicate with AWS services such as:
-
-- Bedrock
-- S3
-- DynamoDB
-- RDS
-- CloudWatch
-- Secrets Manager
-
-Here it is only communicating with **Bedrock Runtime**.
+`boto3` is the official AWS SDK for Python. Here it only communicates with **Bedrock Runtime**, and only inside `ModelService`.
 
 ---
 
 ```python
-from typing import List
+from typing import Any, Dict, List, Optional
 ```
 
-Used only for type hints.
+Used for type hints. For example:
 
 ```python
-def create_embedding(...) -> List[float]
+def invoke_embedding_model(self, text: str, model_id: Optional[str] = None) -> List[float]:
 ```
 
-means:
-
-> This function returns a list of floating point numbers.
-
-Example:
-
-```python
-[0.17, -0.22, 0.45, ...]
-```
+means: this function takes an optional `model_id` override, and always returns a list of floats (the embedding vector).
 
 ---
 
@@ -80,556 +90,190 @@ Example:
 from app.backend.config.settings import settings
 ```
 
-Imports your application configuration.
-
-Instead of hardcoding:
-
-```text
-us-east-1
-```
-
-or:
-
-```text
-anthropic.claude...
-```
-
-everything comes from:
+Imports application configuration instead of hardcoding values. Two settings matter here:
 
 ```python
-settings
+settings.bedrock_llm_model_id   # "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+settings.bedrock_embedding_model_id  # "amazon.titan-embed-text-v2:0"
 ```
 
-For example:
-
-```python
-settings.aws_region
-```
-
-might contain:
-
-```text
-ca-central-1
-```
-
-and:
-
-```python
-settings.bedrock_llm_model_id
-```
-
-might contain:
-
-```text
-anthropic.claude-3-5-sonnet...
-```
-
-This makes the code portable.
+Note the `bedrock_llm_model_id` value: the `us.` prefix means it's a cross-region **inference profile ID**, not a raw foundation model ID. Some Bedrock models (like the Claude Haiku model this project uses) can only be invoked through an inference profile, not by calling `invoke_model` with the bare model ID — this project's `settings` already accounts for that.
 
 ---
 
-# Class Definition
+# `ModelService` — owns the raw Bedrock client
 
 ```python
-class BedrockService:
+class ModelService:
+    def __init__(self):
+        self.client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
 ```
 
-This class is responsible for **all interactions with AWS Bedrock**.
+Same idea as before: one reusable client created once, reused for every request.
 
-Instead of writing:
+## `invoke_text_model()`
 
 ```python
-boto3.client(...)
+def invoke_text_model(
+    self,
+    prompt: str,
+    system_prompt: Optional[str] = None,
+    model_id: Optional[str] = None,
+    max_tokens: int = 1024,
+    temperature: float = 0.3
+) -> str:
+    body: Dict[str, Any] = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
+    }
+
+    if system_prompt:
+        body["system"] = system_prompt
+
+    response = self.client.invoke_model(
+        modelId=model_id or settings.bedrock_llm_model_id,
+        body=json.dumps(body),
+        contentType="application/json",
+        accept="application/json"
+    )
+
+    result = json.loads(response["body"].read())
+    return result["content"][0]["text"].strip()
 ```
 
-throughout the project,
+This is a **generic** Claude call — not specific to classification like the old `classify_text()` was. Every agent that talks to Claude (classification, summarization, SQL generation, chart SQL generation, RAG answering, reranking, routing) goes through this one function, just with different `prompt`/`system_prompt`/`max_tokens`/`temperature` arguments.
 
-every component simply uses:
+A few details worth calling out:
+
+- **`system_prompt` is optional and conditional.** `body["system"]` is only added if a system prompt was passed in. Every agent in this project *does* pass one (e.g. `RERANK_SYSTEM_PROMPT`, `SQL_SYSTEM_PROMPT`) — it's how each agent tells Claude what role to play, separate from the per-call `prompt`.
+- **`max_tokens`/`temperature` are not fixed values.** They default to `1024`/`0.3`, but callers override them per use case — e.g. the router agent uses `max_tokens=20` (it only needs one word back) and `temperature=0` (deterministic routing), while `RAGAgent.answer()` uses `max_tokens=800, temperature=0.2` (longer, slightly varied prose).
+- **`model_id` can be overridden per call** via `model_id or settings.bedrock_llm_model_id` — useful if a specific call ever needs a different Claude model, though nothing in this project currently overrides it.
+- **Response parsing is unchanged**: `result["content"][0]["text"].strip()` — same Anthropic Messages API response shape as before.
+
+## `invoke_embedding_model()`
 
 ```python
-bedrock_service.classify_text(...)
+def invoke_embedding_model(
+    self,
+    text: str,
+    model_id: Optional[str] = None
+) -> List[float]:
+    body = {"inputText": text}
+
+    response = self.client.invoke_model(
+        modelId=model_id or settings.bedrock_embedding_model_id,
+        body=json.dumps(body),
+        contentType="application/json",
+        accept="application/json"
+    )
+
+    result = json.loads(response["body"].read())
+    return result["embedding"]
 ```
 
-or:
-
-```python
-bedrock_service.create_embedding(...)
-```
-
-This is an example of the **Service Layer** design pattern.
+Same Titan Embeddings request/response shape as before: `inputText` in, `result["embedding"]` out. The only change from the original design is the `model_id` override parameter, for the same reason as above.
 
 ---
 
-# Constructor
+# `LLMService` — the wrapper agents actually call
 
 ```python
-def __init__(self):
+class LLMService:
+    def __init__(self):
+        self.model_service = ModelService()
+
+    def generate(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        max_tokens: int = 1024,
+        temperature: float = 0.3
+    ) -> str:
+        return self.model_service.invoke_text_model(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature
+        )
 ```
 
-Runs automatically when:
+`generate()` is a direct passthrough to `ModelService.invoke_text_model()` — it exists so agents depend on `LLMService`, not on `ModelService` (and therefore never touch `boto3` or the raw request/response shape at all).
 
 ```python
-service = BedrockService()
+def generate_with_history(
+    self,
+    question: str,
+    history: List[Dict[str, Any]],
+    system_prompt: Optional[str] = None,
+    max_tokens: int = 1024,
+    temperature: float = 0.3
+) -> str:
 ```
 
-is created.
+Builds a single prompt string out of a conversation history plus a new question, then calls `generate()` with it — the general pattern for folding chat history into a stateless `invoke_model` call, since Bedrock's `invoke_model` API has no built-in concept of a multi-turn session. Note: as of this writing, this method has no callers in the codebase — the project's actual session-memory handling threads a `conversation_context` string through `QuestionWorkflow` into the router prompt instead (see `app/backend/workflows/question_workflow.py`), not through this method. It's kept here as a ready-to-use alternative, not dead weight that needs removing, but don't assume it's on the active call path.
 
 ---
 
-## Creating the Bedrock client
+# `EmbeddingService` — the wrapper for embeddings
 
 ```python
-self.client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+class EmbeddingService:
+    def __init__(self):
+        self.model_service = ModelService()
+
+    def create_embedding(self, text: str) -> List[float]:
+        return self.model_service.invoke_embedding_model(text)
+
+    def create_embeddings(self, texts: List[str]) -> List[List[float]]:
+        return [self.create_embedding(text) for text in texts]
 ```
 
-This creates a reusable AWS client.
-
-Think of it as:
-
-```text
-Python
-	|
-	v
-Bedrock Client
-	|
-	v
-AWS Bedrock Runtime
-```
-
-Every request later uses:
-
-```python
-self.client
-```
-
-instead of reconnecting every time.
-
----
-
-# classify_text()
-
-```python
-def classify_text(self, text: str) -> str:
-```
-
-Input:
-
-```text
-Healthcare document
-```
-
-Output:
-
-```text
-clinical guideline
-```
-
-or:
-
-```text
-lab result
-```
-
-etc.
-
----
-
-## Prompt
-
-```python
-prompt = f"""
-```
-
-This is prompt engineering.
-
-The model receives instructions like:
-
-```text
-Classify the following healthcare content...Return only the category name.
-```
-
-Then your document.
-
-Example:
-
-```text
-Patient is diagnosed with diabetes...
-```
-
-Claude receives:
-
-```text
-Classify...Content:Patient is diagnosed...
-```
-
----
-
-## Why
-
-```python
-{text[:4000]}
-```
-
-instead of:
-
-```python
-{text}
-```
-
-Because LLMs have context limits.
-
-This keeps only the first 4000 characters.
-
-Otherwise:
-
-- larger cost
-- slower inference
-- possible token limit exceeded
-
----
-
-# Request Body
-
-```python
-body = {
-```
-
-Everything inside is the request sent to Claude.
-
----
-
-## anthropic_version
-
-```python
-"anthropic_version": "bedrock-2023-05-31"
-```
-
-AWS Bedrock requires specifying which Anthropic API format is being used.
-
----
-
-## max_tokens
-
-```python
-"max_tokens": 100
-```
-
-Maximum response length.
-
-Since you only expect:
-
-```text
-lab result
-```
-
-100 tokens is more than enough.
-
----
-
-## temperature
-
-```python
-"temperature": 0
-```
-
-Very important.
-
-Temperature controls randomness.
-
-Temperature 1:
-
-```text
-Maybe...Perhaps...
-```
-
-Temperature 0:
-
-```text
-Always deterministic.
-```
-
-For classification,
-
-temperature should almost always be:
-
-```text
-0
-```
-
-because you want consistency.
-
----
-
-## Messages
-
-```python
-"messages": [
-```
-
-Claude uses a chat format.
-
-Here there is only one message.
-
-```python
-{"role": "user", "content": prompt}
-```
-
-Equivalent to a user asking ChatGPT:
-
-```text
-Please classify this.
-```
-
----
-
-# Invoke Model
-
-```python
-response = self.client.invoke_model(...)
-```
-
-This sends the request to AWS.
-
-Parameters:
-
-```python
-modelId=settings.bedrock_llm_model_id
-```
-
-Example:
-
-```text
-Claude 3.5 Sonnet
-```
-
----
-
-```python
-body=json.dumps(body)
-```
-
-Converts Python dictionary
-
-v
-
-JSON
-
-v
-
-HTTP request
-
-v
-
-AWS
-
----
-
-```python
-contentType="application/json"
-```
-
-Tells AWS:
-
-```text
-I'm sending JSON.
-```
-
----
-
-```python
-accept="application/json"
-```
-
-Tells AWS:
-
-```text
-Return JSON.
-```
-
----
-
-# Response
-
-AWS returns something like:
-
-```json
-{
-	"content": [
-		{
-			"text": "clinical guideline"
-		}
-	]
-}
-```
-
----
-
-```python
-result = json.loads(response["body"].read())
-```
-
-Steps:
-
-Read bytes
-
-v
-
-Convert to string
-
-v
-
-Convert JSON into Python dictionary
-
----
-
-Finally:
-
-```python
-return result["content"][0]["text"].strip()
-```
-
-returns:
-
-```text
-clinical guideline
-```
-
-The caller never sees the raw AWS response.
-
----
-
-# create_embedding()
-
-```python
-def create_embedding(...)
-```
-
-Instead of generating text,
-
-this function generates **embeddings**.
-
-Input:
-
-```text
-Patient has diabetes
-```
-
-Output:
-
-```python
-[0.23, -0.14, ...]
-```
-
-Thousands of numbers.
-
----
-
-# Request
-
-```python
-body = {"inputText": text}
-```
-
-Unlike Claude,
-
-Titan Embeddings expects:
-
-```text
-inputText
-```
-
-instead of:
-
-```text
-messages
-```
-
-Different models have different APIs.
-
----
-
-# Invoke Model
-
-```python
-response = self.client.invoke_model(...)
-```
-
-Now:
-
-```python
-modelId=settings.bedrock_embedding_model_id
-```
-
-points to something like:
-
-```text
-amazon.titan-embed-text-v2
-```
-
-instead of Claude.
-
----
-
-# Response
-
-Titan returns:
-
-```json
-{
-	"embedding": [
-		0.12,
-		-0.43,
-		...
-	]
-}
-```
-
-This code:
-
-```python
-return result["embedding"]
-```
-
-returns the vector.
+`create_embedding()` mirrors `LLMService.generate()`: a thin passthrough so callers never see `ModelService` directly. `create_embeddings()` (plural) is a convenience loop over `create_embedding()` — it is **not** a true batch API call; Titan's `invoke_model` only accepts one `inputText` per request, so embedding N texts still means N separate Bedrock calls, just issued from one function.
 
 ---
 
 # Where is this used?
 
-Typically, the flow in your application looks like this:
-
 ```text
-								User uploads document
-												|
-												v
-								BedrockService
-									/           \
-								 /             \
-								v               v
-			classify_text()    create_embedding()
-								|               |
-								v               v
-		 "patient report"     [0.2,-0.1,...]
-								|               |
-								+-------+-------+
-												|
-												v
-						Store in OpenSearch / Vector DB
-												|
-												v
-						 Future semantic search & RAG
+                        User uploads document / asks a question
+                                        │
+              ┌─────────────────────────┴─────────────────────────┐
+              ▼                                                     ▼
+   Agents that generate text                          Agents/services that embed text
+   (ClassificationAgent, SummarizationAgent,           (RAGAgent via EmbeddingService,
+    SQLAgent, ChartAgent, RAGAgent,                     DocumentIngestionWorkflow via
+    RouterAgent, FinalAnswerAgent, GraphRAGAgent, ...)   EmbeddingService)
+              │                                                     │
+              ▼                                                     ▼
+      LLMService.generate()                          EmbeddingService.create_embedding()
+              │                                                     │
+              ▼                                                     ▼
+  ModelService.invoke_text_model()                 ModelService.invoke_embedding_model()
+              │                                                     │
+              ▼                                                     ▼
+        Claude (via inference profile)                    Titan Embeddings
+              │                                                     │
+              ▼                                                     ▼
+    "clinical guideline", SQL text,                        [0.2, -0.1, ...]
+    RAG answers, rerank order, etc.                                 │
+                                                                     ▼
+                                                     Stored in OpenSearch (bulk-indexed —
+                                                     see docs/aws-storage.md) for future
+                                                     semantic search & RAG retrieval
 ```
 
-The **classification** result is useful for organizing or routing documents, while the **embedding** is stored in a vector database (such as OpenSearch) so that future user queries can retrieve semantically similar documents.
+The **text-generation** side is used for far more than classification now — it powers routing, SQL generation (including the chart explorer's aggregation SQL), summarization, RAG answer synthesis, and reranking. The **embedding** side is used both when a document is first ingested (to build its searchable vectors) and every time a user asks a `rag`-routed question (to embed the question itself for the kNN search).
 
 ## Why this design is good
 
-This class follows several software engineering best practices:
+- **Single Responsibility Principle:** `ModelService` only handles raw Bedrock communication; `LLMService`/`EmbeddingService` only handle "what does a generic text/embedding call look like"; agents only handle "what prompt does *my* use case need."
+- **Single owner of the raw client:** only `ModelService` ever constructs a `boto3` Bedrock client or calls `invoke_model` directly — no other file in the project does, which keeps AWS SDK details (and any future SDK-level changes) contained to one place.
+- **Reusability:** any agent can call `self.llm_service.generate(...)` or `self.embedding_service.create_embedding(...)` without duplicating request-building or response-parsing code.
+- **Maintainability:** switching Claude models, changing the embedding model, or even swapping Bedrock for another provider only requires changes in `ModelService` — every agent stays untouched.
+- **Configuration-driven:** model IDs (including the inference-profile nuance above) and the AWS region come from `settings`, so different environments don't require code changes.
 
-- **Single Responsibility Principle:** It only handles communication with AWS Bedrock.
-- **Encapsulation:** The rest of the application doesn't need to know Bedrock's API details, request formats, or response parsing.
-- **Reusability:** Any part of the application can call `classify_text()` or `create_embedding()` without duplicating code.
-- **Maintainability:** If you later switch from Claude to another Bedrock model (or even another provider), you only need to update this service instead of changing code throughout the project.
-- **Configuration-driven:** Model IDs and the AWS region come from `settings`, making it easy to use different environments (development, staging, production) without changing the code itself.
-
-This service layer is a common pattern in production AI systems because it isolates external service interactions behind a clean, reusable interface.
+This three-layer split is a natural evolution of the original single-`BedrockService` design once the number of distinct LLM use cases grew past "just classification and embeddings."

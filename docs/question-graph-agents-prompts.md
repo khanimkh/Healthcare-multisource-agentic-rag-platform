@@ -1,5 +1,7 @@
 # Guide: `graphs/question_graph.py`, `agents/*.py`, `prompts/*.py`
 
+> Updated to match the current code — covers `classification`'s document-resolution fix, `RAGAgent`'s reranking and source deduplication, the shared `tools/document_resolution.py` (used by both `SummarizationAgent` and `ClassificationAgent`), the `SchemaService` extraction (§7), and the `clean_sql_response()` fix. The Insights tab's chart explorer (`ChartAgent`/`VisualizationWorkflow`) is intentionally out of scope — see the note at the end of §4.
+
 This guide explains the question-answering side of the platform: how a user's question turns into a routed, tool-backed, source-cited answer.
 
 `docs/workflows.md` covers **ingestion** (files going in). This guide covers **question answering** (questions going out).
@@ -121,9 +123,7 @@ Every agent is instantiated **once** when this module is imported, not once per 
 
 **`run_summarization(state)`** — calls `SummarizationAgent.summarize_document(question=state["question"], available_documents=state.get("available_document_records"))`, which resolves *which* uploaded document the question refers to (see the updated `SummarizationAgent` section below) before summarizing. `sources` is set to `[result["document"]]` when a document was resolved, or `[]` if the agent fell back to summarizing the question text directly (e.g. no documents exist yet, or none matched).
 
-**`run_classification(state)`** — calls `ClassificationAgent.classify_document(text=state["question"])`. Sets `sources` to `[]`.
-
-> **Design note**: `run_classification` still classifies the **question text itself**, not a resolved document — it doesn't yet have the same document-resolution step `run_summarization` gained. That's a reasonable default for "what category is this content?" when a user pastes text directly, but "classify the readmission policy" by file reference wouldn't resolve to real content today. The resolution logic in `SummarizationAgent._resolve_document()` could be extracted and reused here later.
+**`run_classification(state)`** — calls `ClassificationAgent.classify_uploaded_document(question=state["question"], available_documents=state.get("available_document_records"))`, which resolves *which* uploaded document the question refers to (the same shared resolution step `run_summarization` uses — see the updated `ClassificationAgent`/`SummarizationAgent` sections below) before classifying its actual indexed text. `sources` is set to `[result["document"]]` when a document was resolved, or `[]` if the agent fell back to classifying the raw question text directly (e.g. "classify the readmission policy" now resolves to the real document instead of just classifying that sentence).
 
 **`compose_final_answer(state)`** — calls `FinalAnswerAgent.compose()` with everything gathered so far, then — if `session_id` is present — persists both the user's question and the assistant's answer to `MemoryService` (Postgres + Redis, see `docs/cache_memory_service.md`). This is the only node that touches conversation memory; individual tool nodes are memory-agnostic.
 
@@ -157,7 +157,7 @@ The fallback matters: a routing LLM call can hallucinate an invalid route name, 
 
 | Method | Does |
 | --- | --- |
-| `generate_sql(question, schema_description)` | Builds the SQL prompt (dialect fixed to `"PostgreSQL"`), asks the LLM, strips whitespace/backticks |
+| `generate_sql(question, schema_description)` | Builds the SQL prompt (dialect fixed to `"PostgreSQL"`), asks the LLM, and cleans the response via the shared `clean_sql_response()` (`utils/sql_cleanup.py`) — strips a leading ` ```sql ` fence, a trailing ` ``` `, and a stray `sql\n` language-tag prefix that a plain `.strip("\`")` doesn't catch. `ChartAgent` (`agents/chart_agent.py`, outside this graph's routing — see the scope note at the end of §4) uses the same helper for the same reason. |
 | `execute(sql)` | Rejects the query via `is_read_only_sql()` (from `utils/validators.py`) before ever touching the database, then runs it through a plain SQLAlchemy `text()` execute and returns rows as a list of dicts |
 | `answer(question, schema_description)` | Composes the two above into `{sql, rows}` |
 
@@ -179,8 +179,14 @@ Same shape as `SQLAgent`, but for Amazon Athena instead of Postgres:
 
 | Method | Does |
 | --- | --- |
-| `retrieve(question, k=5, document_type=None)` | Embeds the question via `EmbeddingService`, then calls `OpenSearchVectorStore.search_chunks()` (a kNN vector search) |
-| `answer(question, k=5, document_type=None)` | Calls `retrieve()`, builds the RAG prompt from the returned chunks, asks the LLM, and returns `{answer, sources}` — `sources` is a cleaned list of `{file_name, file_id, s3_uri, score}` per chunk |
+| `retrieve(question, k=5, document_type=None)` | Embeds the question via `EmbeddingService`, calls `OpenSearchVectorStore.search_chunks()` (a kNN vector search), then passes the results through `rerank_chunks()` before returning |
+| `rerank_chunks(question, chunks)` | Builds a numbered-passage prompt (`prompts/rerank_prompt.py`), asks the LLM to return a JSON array of passage indices ordered by relevance, and reorders `chunks` accordingly. Any chunk the model's response didn't mention is appended at the end, so no result is silently dropped. Skipped entirely (returns `chunks` unchanged) when there's 0 or 1 chunk — nothing to reorder |
+| `_parse_rerank_order(response, chunk_count)` | Regex-extracts a `[...]` array from the LLM's response, JSON-parses it, and filters to valid in-range integers. Returns `None` on any parse failure (not a JSON array, no array found, wrong type) |
+| `answer(question, k=5, document_type=None)` | Calls `retrieve()` (which now returns reranked chunks), builds the RAG prompt from them, asks the LLM, and returns `{answer, sources}` |
+
+**Reranking failure is non-fatal by design**: if `_parse_rerank_order()` returns `None` (the model didn't respond with a clean JSON array), `rerank_chunks()` logs a warning and falls back to the original kNN-ranked order rather than raising — a reranking hiccup degrades result quality slightly, it never breaks the `rag` route.
+
+**Source deduplication**: `answer()`'s `sources` list is built by `_deduplicate_sources(chunks)`, keyed on `file_id` (falling back to `file_name` if `file_id` is missing) — the first (i.e. highest-reranked) occurrence per unique document wins, and later chunks from the same document are dropped from the list. Without this, a document that supplied multiple chunks among the top-k results would show up multiple times in `sources` with the same filename repeated.
 
 This is the only agent that does retrieval before generation — everything else either queries a database directly (`sql`/`s3`) or reasons over the question text alone (`summarization`, `classification`).
 
@@ -214,18 +220,23 @@ Composes `LLMService` and `OpenSearchVectorStore` (to fetch a resolved document'
 | Method | Does |
 | --- | --- |
 | `summarize_document(question, available_documents, instructions=None)` | The entry point used by `question_graph.py`. Resolves which document (if any) the question refers to, fetches its full text, and summarizes it — see below. |
-| `_resolve_document(question, available_documents)` | For each candidate document, splits its filename stem into words (`"readmission_policy.pdf"` → `["readmission", "policy"]`) and scores what fraction of those words appear in the question text. Returns the best match if its score is ≥ 0.5, else `None`. |
 | `summarize(text, instructions=None)` | The actual summarization call — see map-reduce below. Still usable directly (that's the fallback path when no document resolves). |
 | `_summarize_piece(text, instructions)` | One LLM call: builds the prompt via `prompts/summary_prompt.py` and generates. |
 
-**Document resolution, step by step:**
+**Document resolution is shared, not private to this agent.** It used to be a private `_resolve_document()` method here; it's now `resolve_document(question, available_documents)` in `tools/document_resolution.py`, imported by both `SummarizationAgent` and `ClassificationAgent` (see below) — extracted specifically so `ClassificationAgent` didn't have to duplicate the same fuzzy-matching logic when it gained document resolution.
 
 ```text
 question: "summarize the readmission policy"
 available_documents: [{"file_id": "abc", "file_name": "readmission_policy.pdf"}, ...]
         │
         ▼
-_resolve_document() matches "readmission" + "policy" against the question -> abc
+resolve_document() — for each candidate, splits the filename stem into words
+        ("readmission_policy.pdf" -> ["readmission", "policy"]), scores what
+        fraction of those words (len > 2) appear in the question text, keeps
+        the best-scoring match if its score is >= 0.5, else returns None
+        │
+        ▼
+matches "readmission" + "policy" against the question -> abc
         │
         ▼
 OpenSearchVectorStore.get_document_text("abc")
@@ -264,18 +275,25 @@ len(text) <= MAP_REDUCE_THRESHOLD (6000 chars)?
 
 ### `classification_agent.py` → `ClassificationAgent`
 
-Two methods, both funneling into the same category list (`DOCUMENT_CATEGORIES` in `prompts/classification_prompt.py`):
+Composes `LLMService` and `OpenSearchVectorStore` (the same "fetch a resolved document's full text" need `SummarizationAgent` has). Three methods, all funneling into the same category list (`DOCUMENT_CATEGORIES` in `prompts/classification_prompt.py`):
 
 | Method | Input | Used by |
 | --- | --- | --- |
-| `classify_document(text)` | raw extracted text | `document_ingestion_workflow.py`, `question_graph.py`'s `run_classification` |
-| `classify_structured_data(df)` | a DataFrame's column names | `structured_ingestion_workflow.py` |
+| `classify_document(text)` | raw extracted text | `document_ingestion_workflow.py` (at upload time), `classify_uploaded_document()` (below), and as the fallback inside `classify_uploaded_document()` itself |
+| `classify_structured_data(df)` | a DataFrame's column names | `structured_ingestion_workflow.py` (at upload time) |
+| `classify_uploaded_document(question, available_documents=None)` | a chat question | `question_graph.py`'s `run_classification` |
+
+`classify_uploaded_document()` mirrors `SummarizationAgent.summarize_document()`'s pattern exactly: calls the shared `resolve_document(question, available_documents)` (`tools/document_resolution.py`) to find which uploaded document the question refers to, fetches its indexed text via `OpenSearchVectorStore.get_document_text()`, and calls `classify_document()` on the *real document text* rather than the question sentence. If no document resolves (or the resolved one has no indexed text), it falls back to `classify_document(question)` — classifying the raw question text, which was the entire previous behavior for the `classification` route, so this is a strict improvement, not a breaking change. Returns `{category, document}`, where `document` is `None` on the fallback path.
 
 This is the single home for classification in the whole project — both ingestion workflows and the question-answering graph call into it, rather than each maintaining their own category list and prompt (see the "duplicate classification logic" fix in `docs/design-code-general-structure.md`).
 
 ### `final_answer_agent.py` → `FinalAnswerAgent`
 
 One method: `compose(question, route, tool_answer, sources=None, sql=None)`. Takes whatever the tool node produced and asks the LLM to write the actual user-facing answer, folding in citations and the generated SQL (if any) so the final response is self-explanatory rather than a raw dump of `tool_answer`. Returns `{answer, route, sources, sql}` — `question_graph.py` only reads `answer` out of this for `state["final_answer"]`, but the full dict is available if a caller wants the route/sources/sql surfaced separately (which `question_workflow.py` does, in its own return value).
+
+### Out of scope for this doc: `chart_agent.py` → `ChartAgent`
+
+This doc covers the `POST /ask` question-answering graph specifically. There's a second, separate agent — `ChartAgent`, composing `SQLAgent` (for its shared `execute()`/safety-check plumbing) and `LLMService` — that powers the Insights tab's "Explore your data" chart explorer (`POST /visualizations`, `GET /visualizations/suggestions`, served by `workflows/visualization_workflow.py`). It's not wired into `question_graph.py` or `RouterAgent` at all today — asking "show me a chart of X" in the main chat won't currently reach it, since there's no `chart` entry in `router_prompt.py`'s `ROUTES`. It's mentioned here only because it shares `sql_agent.py`'s `clean_sql_response()` fix (above) and reuses the same "example row in the schema description" fix described in §7.
 
 ---
 
@@ -324,21 +342,35 @@ ROUTES: List[str] = ["sql", "s3", "rag", "graph_rag", "summarization", "classifi
 
 ## 7. How `question_workflow.py` feeds this graph
 
-`QuestionWorkflow.ask(question, session_id)` builds the `initial_state` this whole system runs on:
+`QuestionWorkflow.ask(question, session_id)` builds the `initial_state` this whole system runs on. The Postgres-introspection piece now lives in a separate `SchemaService` (`services/schema_service.py`) that `QuestionWorkflow` composes, rather than `QuestionWorkflow` owning its own SQLAlchemy engine and introspection methods directly — `SchemaService` is also reused by `VisualizationWorkflow` for the chart explorer (see the scope note in §4), which is why it was pulled out on its own:
 
 ```text
-Postgres introspection (minus INTERNAL_TABLES: documents, conversation_messages)
-        -> available_tables (partial), schema_description
+SchemaService.describe_tables() (minus INTERNAL_TABLES: documents,
+        conversation_messages, graph_nodes, graph_edges)
+        -> available_tables (partial)
+
+SchemaService.format_description()
+        -> schema_description — one "- table(col1, col2, ...)" line per table,
+           PLUS one real example row per table (e.g. {"patient_id": 1, "age": 45,
+           "diagnosis": "diabetes", "readmitted": "no"}), so the SQL-generating
+           LLM sees actual value formats instead of guessing. This was added
+           after a real bug: without it, the model generated `readmitted = true`
+           against a column that actually stores the text 'yes'/'no', which
+           Postgres rejected. `sql_prompt.py`'s system prompt now explicitly
+           tells the model to match the example row's types/formats.
 
 AthenaService.list_tables()
         -> available_tables (rest)
 
 DocumentStore.list_indexed_document_records()
         -> available_documents (file names only, for the router prompt)
-        -> available_document_records ({file_id, file_name} pairs, for summarization resolution)
+        -> available_document_records ({file_id, file_name} pairs, for
+           summarization AND classification resolution — see §4)
 
 MemoryService.get_recent_messages(session_id)
         -> conversation_context
 ```
+
+`graph_nodes`/`graph_edges` were added to `INTERNAL_TABLES` alongside the `SchemaService` extraction — before that fix, the `sql` route could see the knowledge-graph's own storage tables as if they were queryable user data, which they aren't meant to be.
 
 Then `question_graph.invoke(initial_state)` runs everything described above, and `QuestionWorkflow` extracts `{answer, route, sql, sources}` from the final state for the API layer (`POST /ask`) to return.

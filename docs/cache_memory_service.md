@@ -73,7 +73,7 @@ So you can say:
 | Function | Reads/Writes | Purpose |
 | --- | --- | --- |
 | `add_message(session_id, role, content)` | Postgres insert + cache push | Append one turn to durable history and the recent-turns cache |
-| `get_recent_messages(session_id)` | Cache read (Postgres fallback) | Fast retrieval of the last N turns for prompting; rebuilds the cache from Postgres on a miss |
+| `get_recent_messages(session_id)` | Cache read (Postgres fallback) | Fast retrieval of the last N turns for prompting; on a cache miss, falls back to reading Postgres directly via `get_history()` — this read-through does **not** write back into the cache, so the next call still misses Redis until the next `add_message()` push |
 | `get_history(session_id, limit=50)` | Postgres read | The most recent `limit` turns for a session, returned oldest -> newest |
 | `clear_session(session_id)` | Cache delete | Evict the cached recent turns only; Postgres history is untouched |
 | `delete_session_history(session_id)` | Postgres delete + cache delete | Permanently forget a session's entire history |

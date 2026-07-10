@@ -1,1013 +1,171 @@
-> **Outdated**: this walkthrough documents an earlier version of `api/routes.py` that called `tools.aws_storage`, `tools.database.RDSStorage`, and `glue_catalog.register_metadata()` directly from the route handler. That version no longer exists — `/upload` now delegates to `DocumentIngestionWorkflow`/`StructuredIngestionWorkflow`, and a new `/ask` endpoint calls `QuestionWorkflow`. Kept here for the line-by-line explanations of FastAPI/Python concepts (imports, `UploadFile`, etc.), which are still accurate; the step-by-step flow and the "Router"/"Endpoint"/"Function" walkthrough sections describing the old handler are not.
+# Guide: `api/routes.py`
 
-# Step 1. User uploads a file
+> Full rewrite. The previous version of this doc documented a much older `api/routes.py` that inlined the whole upload pipeline directly in the route handler (calling `tools.aws_storage`, `tools.database.RDSStorage`, `glue_catalog.register_metadata()`, `clean_dataframe()`/`clean_text()` directly) and only had one endpoint, `/upload`. None of that exists anymore — every deleted function/class it described (`RDSStorage`, `glue_catalog.register_metadata()`, `clean_dataframe()`, `clean_text()`, `load_data()`) is confirmed gone from the codebase. The router today is a thin orchestration layer with six real endpoints, each delegating to a workflow class. See `docs/load-data.md`, `docs/rag-utils.md`, `docs/aws-storage.md`, `docs/RDS-glue.md`, and `docs/question-graph-agents-prompts.md` for what each workflow actually does internally — this doc only covers the HTTP layer.
+
+---
+
+# 1. What lives here vs. `main.py`
 
 ```text
-Client
-  │
-  ▼
-POST /upload
+main.py
+────────────────────────
+FastAPI app, CORS middleware
+GET  /        -> serves static/index.html (the frontend)
+GET  /health  -> {"status": "healthy"}
+app.include_router(router)  -> mounts everything below
+────────────────────────
+
+api/routes.py
+────────────────────────
+POST   /upload
+GET    /documents
+DELETE /documents/{file_id}
+POST   /ask
+GET    /visualizations/suggestions
+POST   /visualizations
+────────────────────────
 ```
 
-Example uploads:
-
-- `patients.csv`
-- `report.pdf`
-- `xray.png`
+`/` and `/health` are simple enough that they live directly in `main.py` rather than `routes.py` — no workflow, no business logic, nothing worth a separate router for.
 
 ---
 
-# Step 2. File is temporarily saved locally
+# 2. Module-level singletons
 
 ```python
-with open(local_path, "wb") as buffer:
-	shutil.copyfileobj(file.file, buffer)
+document_ingestion_workflow = DocumentIngestionWorkflow()
+structured_ingestion_workflow = StructuredIngestionWorkflow()
+question_workflow = QuestionWorkflow()
+visualization_workflow = VisualizationWorkflow()
+document_store = DocumentStore()
 ```
 
-The file is first saved on the application server.
-
-Example:
-
-```text
-app/backend/data/raw/
-	  │
-	  └── 34ac12_report.pdf
-```
-
-This local copy is only temporary.
+Same pattern as `question_graph.py`'s agent singletons (`docs/question-graph-agents-prompts.md` §3): constructed once at import time, shared across every request, not recreated per-request. Every route handler below just calls a method on one of these five objects — no route handler constructs a workflow or service itself.
 
 ---
 
-# Step 3. The original file is uploaded to S3 ✅
+# 3. Endpoints, one by one
+
+## `POST /upload` → `UploadResponse`
 
 ```python
-s3_uri = aws_storage.upload_file_to_s3(local_path, s3_key)
+async def upload_file(file: UploadFile = File(...)):
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    local_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}_{original_file_name}")
+
+    with open(local_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    file_type = detect_file_type(local_path)
+
+    if file_type == "unknown":
+        os.remove(local_path)
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
+
+    try:
+        if file_type == "structured":
+            result = structured_ingestion_workflow.ingest(file_path=local_path, file_name=original_file_name)
+        else:
+            result = document_ingestion_workflow.ingest(file_path=local_path, file_name=original_file_name)
+
+        return UploadResponse(file_type=file_type, **result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(local_path):
+            os.remove(local_path)
 ```
 
-where:
+Step by step:
 
-```python
-s3_key = f"raw/{file_id}/{original_file_name}"
-```
+1. **Save locally first** — every upload is written to `app/backend/data/raw/{uuid}_{original_name}` before anything else happens. The `uuid` prefix (not the same UUID as the eventual `file_id` — this one's discarded, `DocumentIngestionWorkflow`/`StructuredIngestionWorkflow` each generate their own `file_id` internally) exists purely to avoid local filename collisions between concurrent uploads of files with the same name.
+2. **`detect_file_type()`** (`tools/data_loader.py`, see `docs/load-data.md`) decides `"structured"` / `"document"` / `"image"` / `"unknown"`. Only `"unknown"` is rejected here with a 400; everything else proceeds.
+3. **Branch to exactly one workflow** — `"structured"` goes to `StructuredIngestionWorkflow.ingest()` (CSV → Glue + Postgres dual-write, `docs/RDS-glue.md`); anything else goes to `DocumentIngestionWorkflow.ingest()` (text extraction → classification → entity extraction → chunk/embed → OpenSearch, `docs/rag-utils.md` + `docs/question-graph-agents-prompts.md`). Note `"image"` also goes to the document workflow, not a separate path — see the routing-branch nuance documented in `docs/load-data.md`.
+4. **`UploadResponse(file_type=file_type, **result)`** — the workflow's return dict is spread into the response model; `file_type` is added here because the workflows themselves don't know (or need to know) which branch dispatched them.
+5. **`finally: os.remove(local_path)`** — the local temp copy is deleted whether ingestion succeeded or raised. Nothing in this pipeline keeps a permanent local copy; the durable copy is the one `AWSStorage.upload_file_to_s3()` writes to S3, inside the workflow.
+6. **Any exception during ingestion becomes a 500** with the raw exception message as `detail` — there's no partial-success response; either the whole workflow completes or the client gets an error (though the workflow itself still marks the document `"failed"` in Postgres before re-raising, so the failure is visible in `GET /documents` too).
 
-Example:
-
-```text
-S3 Bucket
-raw/
-   34ac12/
-		report.pdf
-```
-
-The returned value might be:
-
-```text
-s3://healthcare-bucket/raw/34ac12/report.pdf
-```
-
-So **yes, every uploaded file is stored in Amazon S3.**
-
----
-
-# Step 4. The file is processed
-
-Depending on the file type:
-
-### Structured file
-
-```text
-CSV
- ↓
-Clean dataframe
- ↓
-Classify
- ↓
-Save into PostgreSQL
-```
-
----
-
-### Document or image
-
-```text
-PDF
- ↓
-Extract text
- ↓
-Clean text
- ↓
-Classify
- ↓
-Chunk
- ↓
-Embedding
- ↓
-OpenSearch
-```
-
----
-
-# Step 5. Metadata is registered in the Glue Catalog
-
-This happens here:
+## `GET /documents` → `List[DocumentRecordResponse]`
 
 ```python
-glue_registered = glue_catalog.register_metadata(...)
+async def list_documents():
+    return document_store.list_all_documents()
 ```
 
-Notice what metadata is passed:
+The thinnest endpoint in the file — a direct passthrough to `DocumentStore.list_all_documents()` (`docs/RDS-glue.md`), ordered newest-first. This is what the Upload tab's document list renders. It's unrelated to the Insights tab's chart suggestions below — those come from `SchemaService` introspecting Postgres table *schemas* directly via SQLAlchemy, not from the `documents` metadata table at all (which is explicitly excluded from that introspection via `INTERNAL_TABLES`, see `docs/question-graph-agents-prompts.md` §7).
 
-```python
-metadata = {
-	"document_type": document_type,
-	"file_id": file_id,
-	"rds_table": rds_table,
-	"opensearch_index": opensearch_index,
-	"chunks_created": chunks_created,
-}
-```
-
-Also outside the metadata object:
+## `DELETE /documents/{file_id}`
 
 ```python
-dataset_name = original_file_name
-s3_uri = s3_uri
-file_type = file_type
+async def delete_document(file_id: str):
+    document = document_store.get_document(file_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    document_ingestion_workflow.vector_store.delete_chunks(file_id)
+    document_ingestion_workflow.storage.delete_file(document["s3_uri"])
+    document_store.delete_document(file_id)
+
+    return {"status": "deleted", "file_id": file_id, "note": "..."}
 ```
 
-So the Glue Catalog receives information similar to:
+Three cleanup calls, in order: OpenSearch chunks, the S3 object, then the Postgres `documents` row. Notice this always reuses `document_ingestion_workflow.vector_store`/`.storage` — even when deleting a structured (CSV) upload, whose file was actually uploaded via `structured_ingestion_workflow`'s own separate `AWSStorage` instance. This works because `AWSStorage`/`OpenSearchVectorStore` are stateless clients scoped to the same S3 bucket / OpenSearch index regardless of which workflow constructed them, not because there's only one instance — there are two separate `AWSStorage()` instances (one per ingestion workflow), and this endpoint happens to always use `document_ingestion_workflow`'s one rather than picking the workflow that actually created the file.
 
-```text
-Field               Example
-dataset_name        report.pdf
-S3 URI              s3://bucket/raw/...
-file_type           document
-document_type       clinical guideline
-file_id             34ac12...
-rds_table           dataset_34ac12
-OpenSearch index    healthcare-documents
-chunks_created      18
-```
+**What this does NOT clean up**, and the response's own `note` field says so explicitly: the Glue table and any knowledge-graph (`graph_nodes`/`graph_edges`) entries created from this document. It also silently doesn't clean up the Postgres dual-write table (e.g. `test_patients`) for a deleted CSV upload — not even mentioned in the `note`, a gap documented in `docs/RDS-glue.md`. Deleting a document today means its data may still be fully queryable via `sql`/`s3` after the fact, even though it's gone from the document list, RAG, and classification/summarization resolution.
 
----
-
-# Step 6. Metadata is cached in Redis
-
-Later:
+## `POST /ask` → `QuestionResponse`
 
 ```python
-cache.set_json(...)
+async def ask_question(request: QuestionRequest):
+    result = question_workflow.ask(question=request.question, session_id=request.session_id)
+    return QuestionResponse(**result)
 ```
 
-stores:
+The entire question-answering system (routing, all six tool agents, final answer composition, conversation memory) lives behind this one call to `QuestionWorkflow.ask()` — see `docs/question-graph-agents-prompts.md` for everything that happens inside it. This endpoint itself does nothing but pass the request through and wrap exceptions.
 
-```python
-{
-	"file_name": ...,
-	"file_type": ...,
-	"document_type": ...,
-	"s3_uri": ...,
-	"rds_table": ...,
-	"opensearch_index": ...,
-}
-```
-
-Redis is **not permanent storage**.
-
-It is only used for faster access.
-
----
-
-# What is stored where?
-
-## Amazon S3
-
-Stores the **original file**.
-
-Example:
-
-```text
-report.pdf
-patients.csv
-image.png
-```
-
----
-
-## PostgreSQL (only structured files)
-
-Stores the cleaned table.
-
-Example:
-
-```text
-Patients Table
-Age | Gender | Diagnosis | ...
-```
-
----
-
-## OpenSearch (documents/images)
-
-Stores:
-
-- chunks
-- embeddings
-- metadata
-
-Example:
-
-```text
-Chunk 1 | Embedding | File name | Document type
-```
-
----
-
-## Glue Catalog
-
-Stores metadata describing the dataset.
-
-It does **not** store the actual document.
-
-Think of it as a catalog or inventory.
-
-Example:
-
-```text
-Dataset Name
-   ↓
-S3 Location
-   ↓
-Document Type
-   ↓
-RDS Table
-   ↓
-OpenSearch Index
-```
-
----
-
-## Redis
-
-Stores temporary metadata for quick retrieval.
-
----
-
-# Overall Architecture
-
-```text
-			 User Upload
-				  │
-				  ▼
-			Save Locally
-				  │
-				  ▼
-			 Upload to S3
-				  │
-				  ▼
-		   Detect File Type
-		  ┌────────┴────────┐
-		  ▼                 ▼
-	 Structured       Document/Image
-		  │                 │
-		  ▼                 ▼
-	  PostgreSQL        OpenSearch
-		  │                 │
-		  └────────┬────────┘
-				   ▼
-		  Glue Metadata Catalog
-				   │
-				   ▼
-			   Redis Cache
-```
----------------------------------
-
-# Overall Architecture
-
-The workflow of this endpoint looks like this:
-
-```text
-										Client
-											│
-							POST /upload
-											│
-											▼
-						 FastAPI Router (this file)
-											│
-			┌───────────────┼────────────────┐
-			▼               ▼                ▼
- Save locally     Detect type     Load content
-			│
-			▼
- Upload to S3
-			│
-			▼
- Is Structured?
-			│
- ┌────┴─────────────┐
- │                  │
- ▼                  ▼
-Structured      Document/Image
- │                  │
- ▼                  ▼
-Clean Data      Clean Text
- │                  │
- ▼                  ▼
-Classify         Classify
- │                  │
- ▼                  ▼
-Save to RDS     Chunk + Embed
- │                  │
- ▼                  ▼
-						 OpenSearch
-										│
-										▼
-						 Register in Glue
-										│
-										▼
-						 Cache Metadata
-										│
-										▼
-					Return UploadResponse
-```
-
----
-
-# Imports
-
-The imports are grouped by responsibility.
-
-## 1. Python Standard Library
+## `GET /visualizations/suggestions` → `ChartSuggestionsResponse`
 
 ```python
-import os
-import uuid
-import shutil
+async def get_chart_suggestions():
+    questions = visualization_workflow.suggest()
+    return ChartSuggestionsResponse(questions=questions)
 ```
 
-These are built into Python.
+Powers the Insights tab's suggestion dropdown — introspects the current Postgres schema and asks an LLM to propose meaningful chart questions. Not part of the `/ask` routing graph at all (see the scope note in `docs/question-graph-agents-prompts.md` §4); this is `ChartAgent`/`VisualizationWorkflow`'s own endpoint.
 
-### os
-
-Used for working with files and folders.
-
-Examples:
+## `POST /visualizations` → `ChartResponse`
 
 ```python
-os.makedirs(...)
+async def generate_chart(request: ChartRequest):
+    result = visualization_workflow.chart(question=request.question)
+    return ChartResponse(**result)
 ```
 
-Create directories.
-
-```python
-os.path.join(...)
-```
-
-Build file paths safely.
+Takes a natural-language chart question (typed or picked from the suggestions dropdown), generates and runs an aggregation SQL query, and returns `{title, sql, labels, values}` ready for the frontend's bar/pie/line chart renderer. This is the only endpoint that catches `ValueError` separately and maps it to a 400 rather than a 500 — `SQLAgent.execute()` (which `ChartAgent.build_chart()` calls into) raises `ValueError` specifically when the generated SQL fails the read-only safety check, which is a client-triggerable "the model didn't produce a safe query" situation, not an unexpected server error.
 
 ---
 
-### uuid
+# 4. Shared FastAPI/Python building blocks
 
-Creates unique IDs.
+These concepts recur across every endpoint above and are worth naming once rather than per-endpoint:
 
-Example:
-
-```python
-uuid.uuid4()
-```
-
-returns something like:
-
-```text
-6fd8e5d8-1d8e-4b5e-bb6c-1d4d39e8d321
-```
-
-Each uploaded file gets a unique identifier.
+| Concept | What it does here |
+| --- | --- |
+| `APIRouter()` | Groups all six endpoints so `main.py` can mount them in one `app.include_router(router)` call instead of registering each individually |
+| `response_model=...` | Every endpoint except `DELETE /documents/{file_id}` declares a Pydantic response model (`UploadResponse`, `List[DocumentRecordResponse]`, `QuestionResponse`, `ChartSuggestionsResponse`, `ChartResponse`) — FastAPI validates the return value against it and generates the OpenAPI schema from it. The delete endpoint returns a plain dict instead, since its shape is a small fixed `{status, file_id, note}` not worth a dedicated schema |
+| `UploadFile = File(...)` | Only `/upload` needs this — it's what makes FastAPI parse the request as `multipart/form-data` instead of JSON |
+| `HTTPException(status_code=..., detail=...)` | The only way any endpoint communicates failure to the client — every endpoint wraps its workflow call in `try/except Exception` and re-raises as a 500 (or a 400, for `/visualizations`'s `ValueError` case, or a 404, for deleting a document that doesn't exist) |
+| `logger.error(...)` before re-raising | Every failure is logged server-side with context (the question, the filename, the file_id) before becoming a generic `HTTPException` — the client sees the raw exception message, but the server log additionally has which request caused it |
 
 ---
 
-### shutil
+# 5. Why this router is designed this way
 
-Used for copying files.
+This router acts as a thin **HTTP-to-workflow adapter**, nothing more. It doesn't perform OCR, generate embeddings, query Bedrock, run SQL, or talk to OpenSearch/Glue/Athena directly — every one of those responsibilities lives in a workflow, agent, or service class, and the router's only job is: parse the HTTP request, call the right workflow method, shape the result into a response model, and translate exceptions into HTTP status codes.
 
-Here:
+- **`DocumentIngestionWorkflow` / `StructuredIngestionWorkflow`**: own the entire upload pipeline for their respective file types.
+- **`QuestionWorkflow`**: owns the entire question-answering pipeline (routing through six agents).
+- **`VisualizationWorkflow`**: owns the chart-explorer pipeline.
+- **`DocumentStore`**: owns reading/writing the `documents` Postgres table.
 
-```python
-shutil.copyfileobj(...)
-```
-
-copies the uploaded file into local storage.
-
----
-
-## 2. FastAPI
-
-```python
-from fastapi import APIRouter, UploadFile, File, HTTPException
-```
-
-These classes provide the API functionality.
-
-### APIRouter
-
-Groups endpoints together.
-
-Example:
-
-```python
-router = APIRouter()
-```
-
-Later:
-
-```python
-app.include_router(router)
-```
-
-adds these endpoints to the application.
-
----
-
-### UploadFile
-
-Represents an uploaded file.
-
-Instead of receiving text,
-
-the endpoint receives:
-
-```text
-report.pdf
-```
-
-or:
-
-```text
-patients.csv
-```
-
----
-
-### File(...)
-
-Tells FastAPI that this parameter is a file upload.
-
----
-
-### HTTPException
-
-Returns HTTP errors.
-
-Example:
-
-```python
-raise HTTPException(
-		status_code=400,
-		detail="Unsupported file",
-)
-```
-
----
-
-# Response Schema
-
-```python
-from app.backend.schemas.upload_schema import UploadResponse
-```
-
-Instead of returning a raw dictionary,
-
-the endpoint returns a validated Pydantic model.
-
----
-
-# Tool Imports
-
-These are helper modules that perform specialized tasks.
-
-### Data Loader
-
-```python
-detect_file_type()
-load_data()
-clean_dataframe()
-clean_text()
-```
-
-Responsible for:
-
-- detecting the file type
-- reading the file
-- cleaning tabular data
-- cleaning extracted text
-
----
-
-### AWS Storage
-
-```python
-AWSStorage()
-```
-
-Uploads files to S3.
-
----
-
-### OpenSearch
-
-```python
-OpenSearchVectorStore()
-```
-
-Stores embeddings for semantic search.
-
----
-
-### Database
-
-```python
-RDSStorage()
-```
-
-Stores structured datasets in PostgreSQL.
-
----
-
-### RAG Utilities
-
-```python
-chunk_documents()
-create_embeddings_for_chunks()
-```
-
-Used only for text documents.
-
-Workflow:
-
-```text
-Document
-	↓
-Chunk
-	↓
-Embedding
-	↓
-Vector Database
-```
-
----
-
-### Glue Catalog
-
-Registers dataset metadata.
-
----
-
-### Classification Agent
-
-Uses an LLM to classify documents.
-
-Example:
-
-```text
-clinical guideline
-patient report
-claims dataset
-```
-
----
-
-### Cache Service
-
-Stores upload metadata in Redis.
-
----
-
-# Router
-
-```python
-router = APIRouter()
-```
-
-Creates the router.
-
----
-
-# Upload Directory
-
-```python
-UPLOAD_DIR = ...
-```
-
-Temporary local folder before uploading to S3.
-
----
-
-# Endpoint
-
-```python
-@router.post("/upload")
-```
-
-Creates:
-
-```text
-POST /upload
-```
-
----
-
-# Function
-
-```python
-async def upload_file(...)
-```
-
-Receives:
-
-```text
-multipart/form-data
-```
-
-containing one uploaded file.
-
----
-
-# Create Upload Folder
-
-```python
-os.makedirs(...)
-```
-
-Creates:
-
-```text
-app/backend/data/raw
-```
-
-if it doesn't already exist.
-
----
-
-# Generate File ID
-
-```python
-file_id = uuid.uuid4()
-```
-
-Every upload gets a unique ID.
-
-Example:
-
-```text
-report.pdf
-	 ↓
-82af....
-	 ↓
-82af_report.pdf
-```
-
----
-
-# Save File Locally
-
-```python
-with open(...)
-```
-
-Creates a file.
-
-```python
-shutil.copyfileobj(...)
-```
-
-Copies uploaded bytes into that file.
-
----
-
-# Detect File Type
-
-```python
-file_type = detect_file_type(...)
-```
-
-Possible results:
-
-```text
-structured
-document
-image
-unknown
-```
-
----
-
-# Unsupported File
-
-```python
-if file_type == "unknown":
-```
-
-Immediately returns HTTP 400.
-
----
-
-# Initialize Services
-
-```python
-aws_storage = AWSStorage()
-classifier = ClassificationAgent()
-cache = CacheService()
-```
-
-Creates reusable service objects.
-
----
-
-# Upload to S3
-
-```python
-s3_uri = aws_storage.upload_file_to_s3(...)
-```
-
-Stores original file.
-
-Example:
-
-```text
-local
-	↓
-S3
-	↓
-s3://bucket/raw/...
-```
-
----
-
-# Load File
-
-```python
-loaded_data = load_data(...)
-```
-
-Different readers depending on extension.
-
-```text
-CSV -> DataFrame
-PDF -> Text
-Image -> OCR text
-```
-
----
-
-# Metadata
-
-```python
-response_metadata
-```
-
-Stores extra information for the response.
-
----
-
-# Initialize Variables
-
-```python
-document_type = None
-```
-
-These variables will later be filled depending on file type.
-
----
-
-# Structured Data Workflow
-
-```python
-if file_type == "structured":
-```
-
-Steps:
-
-```text
-CSV
- ↓
-Clean
- ↓
-Classify
- ↓
-Save into PostgreSQL
-```
-
----
-
-### Clean
-
-```python
-clean_dataframe(...)
-```
-
-Removes invalid values.
-
----
-
-### Classification
-
-```python
-classifier.classify_structured_data(...)
-```
-
-LLM determines dataset type.
-
----
-
-### Save
-
-```python
-rds.save_dataframe(...)
-```
-
-Stores table inside PostgreSQL.
-
----
-
-### Metadata
-
-Stores:
-
-```text
-columns
-rows
-```
-
----
-
-# Document/Image Workflow
-
-```python
-elif file_type in ["document", "image"]:
-```
-
-Pipeline:
-
-```text
-Document
- ↓
-Extract text
- ↓
-Clean text
- ↓
-Classify
- ↓
-Chunk
- ↓
-Embedding
- ↓
-OpenSearch
-```
-
----
-
-### Clean Text
-
-```python
-clean_text(...)
-```
-
-Removes unnecessary formatting.
-
----
-
-### Classification
-
-```text
-Research paper
-Patient report
-Guideline
-```
-
----
-
-### Chunking
-
-```python
-chunk_documents(...)
-```
-
-Large text
- ↓
-Small chunks
-
----
-
-### Embeddings
-
-```python
-create_embeddings_for_chunks(...)
-```
-
-Each chunk
- ↓
-Vector
-
----
-
-### OpenSearch
-
-```python
-index_chunks(...)
-```
-
-Stores vectors for future semantic retrieval.
-
----
-
-# Glue Registration
-
-```python
-glue_catalog.register_metadata(...)
-```
-
-Registers metadata such as:
-
-- S3 location
-- file type
-- document type
-- RDS table
-- OpenSearch index
-
-This makes datasets discoverable for downstream analytics.
-
----
-
-# Cache
-
-```python
-cache.set_json(...)
-```
-
-Stores frequently needed metadata in Redis.
-
-Purpose:
-
-```text
-Next request
-	 ↓
-Redis
-	 ↓
-No database query
-```
-
----
-
-# Response
-
-Finally returns:
-
-```python
-UploadResponse(...)
-```
-
-This matches the schema:
-
-```text
-status
-file name
-S3 URI
-RDS table
-OpenSearch index
-metadata
-```
-
----
-
-# Error Handling
-
-```python
-except Exception as e:
-```
-
-Any unexpected error becomes:
-
-```text
-HTTP 500 Internal Server Error
-```
-
-with the error message.
-
----
-
-# Why is this router designed this way?
-
-This router acts as the **orchestrator** of your upload pipeline. It doesn't perform OCR, generate embeddings, query Bedrock, or execute SQL itself. Instead, it coordinates specialized components, each with a single responsibility:
-
-- **Router**: Receives the HTTP request, validates it, coordinates the workflow, and returns the response.
-- **Data Loader**: Reads and cleans uploaded files.
-- **Classification Agent**: Uses the LLM to identify the document type.
-- **AWS Storage**: Uploads files to Amazon S3.
-- **RDS Storage**: Stores structured datasets in PostgreSQL.
-- **RAG Utilities**: Splits documents into chunks and generates embeddings.
-- **OpenSearch Vector Store**: Indexes embeddings for semantic search.
-- **Glue Catalog**: Registers dataset metadata.
-- **Cache Service**: Stores frequently accessed metadata in Redis.
-
-This separation of concerns makes the application easier to maintain, test, and extend. For example, if you later switch from OpenSearch to another vector database or from Bedrock to another LLM provider, most changes will be isolated to the corresponding service class rather than this API endpoint.
+This separation is what let every feature documented elsewhere in `docs/` (reranking, source deduplication, the `SchemaService` extraction, the shared `resolve_document()`) get added without a single line of `routes.py` changing beyond the new endpoint declarations themselves — the router doesn't know or care how a workflow does its job internally.

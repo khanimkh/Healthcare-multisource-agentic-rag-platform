@@ -1,6 +1,6 @@
 # Guide: `structured_ingestion_workflow.py` and `document_ingestion_workflow.py`
 
-This guide explains the purpose, flow, and functions/classes used in the two ingestion workflow files.
+> Updated to match the current code. Both workflows grew real steps since this doc was first written — structured ingestion gained classification and a Postgres dual-write, document ingestion gained entity/relationship graph extraction — and every "RDS" reference has been corrected to "Postgres" (this project uses a self-hosted `postgres:16-alpine` Docker container, not AWS RDS — see `docs/RDS-glue.md`).
 
 ---
 
@@ -10,20 +10,21 @@ These files are responsible for orchestrating ingestion workflows.
 
 They do not implement low-level AWS logic themselves. Instead, they call services and tools such as:
 
-- `AWSStorage`
-- `DocumentStore`
-- `GlueCatalog`
-- `OpenSearchVectorStore`
-- `ClassificationAgent`
-- `data_loader`
-- `rag_utils`
+- `AWSStorage`, `OpenSearchVectorStore` (`services/aws_storage_service.py`, see `docs/rag-utils.md`)
+- `DocumentStore` (`services/document_store_service.py`, see `docs/RDS-glue.md`)
+- `GlueCatalog` (`services/glue_catalog_service.py`, see `docs/RDS-glue.md`)
+- `RelationalDataStore` (`services/relational_store_service.py`) — new since this doc was first written
+- `GraphStoreService` (`services/graph_store_service.py`) — new since this doc was first written
+- `ClassificationAgent` (`agents/classification_agent.py`, see `docs/question-graph-agents-prompts.md`)
+- `tools/data_loader.py`, `tools/rag_utils.py`, `tools/entity_extraction.py`
 
 In simple words:
 
 ```text
 Workflow files = coordinate multiple steps together
-Service files = connect to external systems
-Tool files = prepare/process data
+Service files  = connect to external systems
+Agent files    = call the LLM
+Tool files     = prepare/process data
 ```
 
 ---
@@ -32,22 +33,28 @@ Tool files = prepare/process data
 
 ### Purpose
 
-This file handles structured files such as CSV.
+This file handles structured files — currently CSV only (`.xlsx`/`.xls` are rejected, see `docs/load-data.md`).
 
-Current flow:
+**Current flow** — two real steps this doc previously omitted entirely, marked below:
 
 ```text
 CSV file
-   ↓
+   |
 Upload to S3
-   ↓
-Create document record in RDS
-   ↓
-Read CSV with pandas
-   ↓
-Register metadata in AWS Glue
-   ↓
-Update RDS status
+   |
+Create document record in Postgres (status: uploaded)
+   |
+Update status to processing
+   |
+Read CSV with pandas (via load_csv())
+   |
+Classify the dataset            <- classification was added after this doc was first written
+   |
+Register schema/location in AWS Glue   (Athena-queryable)
+   |
+Dual-write the DataFrame into Postgres  <- also added after this doc was first written
+   |                                       (sql-route-queryable)
+Update status to registered (with the classified category)
 ```
 
 ### Main class
@@ -56,24 +63,26 @@ Update RDS status
 class StructuredIngestionWorkflow:
 ```
 
-This class controls the full structured file ingestion process.
-
 ### `__init__()`
 
 ```python
 def __init__(self):
-	self.storage = AWSStorage()
-	self.document_store = DocumentStore()
-	self.glue_catalog = GlueCatalog()
+    self.storage = AWSStorage()
+    self.document_store = DocumentStore()
+    self.glue_catalog = GlueCatalog()
+    self.classification_agent = ClassificationAgent()
+    self.relational_store = RelationalDataStore()
 ```
-
-Initializes the services needed for structured ingestion.
 
 | Service | Purpose |
 | --- | --- |
 | `AWSStorage` | Uploads file to S3 |
-| `DocumentStore` | Stores file metadata/status in RDS |
-| `GlueCatalog` | Registers CSV schema/location in AWS Glue |
+| `DocumentStore` | Stores file metadata/status in Postgres |
+| `GlueCatalog` | Registers CSV schema/location in AWS Glue, for Athena |
+| `ClassificationAgent` | Classifies the dataset's category from its column names |
+| `RelationalDataStore` | Dual-writes the actual DataFrame into a real Postgres table |
+
+Two of these five (`ClassificationAgent`, `RelationalDataStore`) didn't exist in the original version of this workflow — they were added to make classification apply to structured uploads too, and to make uploaded CSVs actually queryable via the `sql` route (Postgres), not just `s3` (Athena).
 
 ### `ingest_csv()`
 
@@ -81,157 +90,102 @@ Initializes the services needed for structured ingestion.
 def ingest_csv(self, file_path: str, file_name: str) -> Dict[str, Any]:
 ```
 
-Processes one CSV file.
-
-Input:
-
-| Parameter | Meaning |
-| --- | --- |
-| `file_path` | Local path of the uploaded file |
-| `file_name` | Original filename |
-
-Example:
-
-```python
-file_path = "/tmp/patients.csv"
-file_name = "patients.csv"
-```
+Processes one CSV file, step by step:
 
 #### Step 1: Upload to S3
 
 ```python
-upload_result = self.storage.upload_file_to_s3(
-	file_path=file_path,
-	file_name=file_name
-)
+upload_result = self.storage.upload_file_to_s3(file_path=file_path, file_name=file_name)
 ```
 
-Returns:
+Returns `{file_id, file_name, s3_key, s3_uri}`.
 
-```python
-{
-	"file_id": "...",
-	"file_name": "...",
-	"s3_key": "...",
-	"s3_uri": "..."
-}
-```
-
-#### Step 2: Create RDS document record
+#### Step 2: Create the Postgres document record
 
 ```python
 self.document_store.create_document(
-	file_id=file_id,
-	file_name=file_name,
-	s3_uri=s3_uri,
-	document_type="structured_dataset"
+    file_id=file_id, file_name=file_name, s3_uri=s3_uri,
+    document_type="structured_dataset"
 )
 ```
 
-Creates a row in PostgreSQL:
+`document_type` here is a **placeholder** — `"structured_dataset"` literally, not yet the real classified category (that comes in Step 4). See `docs/RDS-glue.md` for the exact `documents` table schema this writes to.
 
-```text
-file_id
-file_name
-s3_uri
-document_type
-status = uploaded
-uploaded_at
-```
-
-RDS is used for application metadata, not for storing the CSV data itself.
-
-#### Step 3: Update status to processing
+#### Step 3: Update status to `processing`
 
 ```python
-self.document_store.update_status(
-	file_id=file_id,
-	status="processing"
-)
+self.document_store.update_status(file_id=file_id, status="processing")
 ```
 
-The file is now marked as being processed.
-
-#### Step 4: Read CSV
+#### Step 4: Read the CSV, then classify it
 
 ```python
 df = load_csv(file_path)
+document_type = self.classification_agent.classify_structured_data(df)
 ```
 
-The CSV is loaded through `tools/data_loader.py`'s `load_csv()` (not `pandas` directly), keeping all file-loading logic in one place, the same way `document_ingestion_workflow.py` loads text through `load_document()`. This is needed because Glue needs the schema:
+`load_csv()` goes through `tools/data_loader.py` (see `docs/load-data.md`), not raw `pandas` in the workflow — keeps all file-loading logic in one place. `classify_structured_data()` (`ClassificationAgent`, `docs/question-graph-agents-prompts.md`) classifies from the DataFrame's **column names only**, not its values — e.g. `patient_id, age, diagnosis, readmitted` might classify as `"patient report"`. This `document_type` is what ends up in the final `update_status()` call and the API response, replacing the `"structured_dataset"` placeholder from Step 2.
 
-```text
-column names
-column types
-```
-
-#### Step 5: Register Glue table
+#### Step 5: Register the Glue table
 
 ```python
-table_name = self.glue_catalog.register_csv_table(
-	dataset_name=dataset_name,
-	s3_uri=s3_uri,
-	df=df
-)
+dataset_name = Path(file_name).stem
+table_name = self.glue_catalog.register_csv_table(dataset_name=dataset_name, s3_uri=s3_uri, df=df)
 ```
 
-Glue stores:
+Glue stores table name, columns, data types, and S3 location — not the actual rows. See `docs/RDS-glue.md` for `register_csv_table()`'s real implementation (column-name normalization, OpenCSVSerde config, create-or-update-table logic).
 
-```text
-table name
-columns
-data types
-S3 location
-CSV format
-```
-
-Glue does not store the actual CSV rows. The actual CSV is stored in S3.
-
-#### Step 6: Update status to registered
+#### Step 6: Dual-write into Postgres
 
 ```python
-self.document_store.update_status(
-	file_id=file_id,
-	status="registered",
-	document_type="structured_dataset"
-)
+postgres_table = self.relational_store.load_dataframe(dataset_name=dataset_name, df=df)
 ```
 
-This means the structured dataset is ready for Athena queries.
+`RelationalDataStore.load_dataframe()` calls `df.to_sql(table_name, self.engine, if_exists="replace", index=False)` — the table name goes through the same `normalize_table_name()` helper Glue uses (`utils/naming.py`), so a CSV named `patients.csv` becomes both Glue table `patients` and Postgres table `patients`. This is what makes `SQLAgent` (the `sql` route) able to see and query uploaded CSVs — before this step existed, only `S3Agent`/Athena could.
 
-Return value:
+#### Step 7: Update status to `registered`
 
 ```python
+self.document_store.update_status(file_id=file_id, status="registered", document_type=document_type)
+```
+
+`document_type` is the real classified value from Step 4, not the `"structured_dataset"` placeholder.
+
+### Return value
+
+```python
+sample_rows = json.loads(df.head(5).to_json(orient="records"))
+
 return {
-	"status": "registered",
-	"file_id": file_id,
-	"file_name": file_name,
-	"s3_uri": s3_uri,
-	"glue_database": settings.glue_database_name,
-	"glue_table": table_name,
-	"rows": len(df),
-	"columns": list(df.columns)
+    "status": "registered",
+    "file_id": file_id,
+    "file_name": file_name,
+    "s3_uri": s3_uri,
+    "document_type": document_type,
+    "glue_database": settings.glue_database_name,
+    "glue_table": table_name,
+    "postgres_table": postgres_table,
+    "rows": len(df),
+    "columns": list(df.columns),
+    "sample_rows": sample_rows
 }
 ```
+
+`postgres_table` and `sample_rows` are new fields since this doc was first written — `sample_rows` uses `df.head(5).to_json(orient="records")` then `json.loads()` (not `.to_dict(orient="records")`) specifically because `to_json` handles NaN/numpy dtypes safely, where `.to_dict()` can produce values the JSON encoder chokes on. The frontend's Upload tab renders `sample_rows` as a real preview table.
 
 ### `ingest()`
 
 ```python
 def ingest(self, file_path: str, file_name: str) -> Dict[str, Any]:
+    extension = Path(file_name).suffix.lower()
+
+    if extension == ".csv":
+        return self.ingest_csv(file_path, file_name)
+
+    raise ValueError(f"Unsupported structured file type: {extension}")
 ```
 
-Generic entry point for structured file ingestion. Currently it supports only `.csv`.
-
-```python
-extension = Path(file_name).suffix.lower()
-
-if extension == ".csv":
-	return self.ingest_csv(file_path, file_name)
-
-raise ValueError(f"Unsupported structured file type: {extension}")
-```
-
-Later you can add Excel or Parquet support.
+Still CSV-only, unchanged. `.xlsx`/`.xls` files reach this method (since `detect_file_type()` classifies them as `"structured"`) but are rejected here with a clean `ValueError` — see the real gap this causes, documented in `docs/load-data.md`.
 
 ---
 
@@ -239,28 +193,33 @@ Later you can add Excel or Parquet support.
 
 ### Purpose
 
-This file handles unstructured documents such as PDF, DOCX, and TXT.
+This file handles unstructured documents — PDF, DOCX, TXT, and (via OCR) images.
 
-Current flow:
+**Current flow** — one entire real step this doc previously omitted:
 
 ```text
-Document file
-   ↓
+Document/image file
+   |
 Upload to S3
-   ↓
-Create document record in RDS
-   ↓
-Extract text
-   ↓
+   |
+Create document record in Postgres (status: uploaded)
+   |
+Update status to processing
+   |
+Extract text (load_document() — dispatches by extension, see docs/load-data.md)
+   |
 Classify document type
-   ↓
-Split text into chunks
-   ↓
+   |
+Extract entities + relationships, upsert into the knowledge graph  <- entirely
+   |                                                                   missing
+   |                                                                   from this
+Split text into chunks                                                doc before
+   |
 Create embeddings
-   ↓
+   |
 Bulk index chunks into OpenSearch
-   ↓
-Update RDS status
+   |
+Update status to indexed
 ```
 
 ### Main class
@@ -269,204 +228,138 @@ Update RDS status
 class DocumentIngestionWorkflow:
 ```
 
-This class controls the full document ingestion process.
-
 ### `__init__()`
 
 ```python
 def __init__(self):
-	self.storage = AWSStorage()
-	self.vector_store = OpenSearchVectorStore()
-	self.classification_agent = ClassificationAgent()
-	self.document_store = DocumentStore()
+    self.storage = AWSStorage()
+    self.vector_store = OpenSearchVectorStore()
+    self.classification_agent = ClassificationAgent()
+    self.document_store = DocumentStore()
+    self.graph_store = GraphStoreService()
 ```
 
 | Service | Purpose |
 | --- | --- |
 | `AWSStorage` | Uploads original document to S3 |
-| `OpenSearchVectorStore` | Stores chunk embeddings in OpenSearch |
-| `ClassificationAgent` | Classifies text into a document category (chunk embeddings are created separately via `rag_utils.create_embeddings_for_chunks`, backed by `EmbeddingService`) |
-| `DocumentStore` | Tracks document status in RDS |
+| `OpenSearchVectorStore` | Bulk-indexes chunk embeddings, see `docs/aws-storage.md` |
+| `ClassificationAgent` | Classifies text into a document category |
+| `DocumentStore` | Tracks document status in Postgres |
+| `GraphStoreService` | Upserts extracted entities/relationships into the `graph_nodes`/`graph_edges` Postgres tables — the entire reason `graph_rag` has anything to retrieve from |
+
+`GraphStoreService` is the piece this doc previously left out completely.
 
 ### `ingest()`
 
-```python
-def ingest(self, file_path: str, file_name: str) -> Dict[str, Any]:
-```
-
-Processes one unstructured document.
-
-#### Step 1: Upload to S3
-
-```python
-upload_result = self.storage.upload_file_to_s3(
-	file_path=file_path,
-	file_name=file_name
-)
-```
-
-Example S3 location:
-
-```text
-s3://bucket/uploads/<file_id>/clinical_guideline.pdf
-```
-
-#### Step 2: Create RDS document record
-
-```python
-self.document_store.create_document(
-	file_id=file_id,
-	file_name=file_name,
-	s3_uri=s3_uri,
-	document_type="document"
-)
-```
-
-Initial status is `uploaded`.
-
-#### Step 3: Update status to processing
-
-```python
-self.document_store.update_status(
-	file_id=file_id,
-	status="processing"
-)
-```
-
-This indicates that extraction, chunking, embedding, and indexing are in progress.
+Steps 1–3 (upload to S3, create the Postgres record with `document_type="document"`, update status to `processing`) are unchanged from the original version of this doc — see §2 above for the equivalent pattern.
 
 #### Step 4: Extract text
 
 ```python
 text = load_document(file_path)
+
+if not text or not text.strip():
+    raise ValueError("No text could be extracted from the document.")
 ```
 
-This calls the data loader. Depending on file type, it may load PDF, DOCX, or TXT.
+`load_document()` dispatches to `load_pdf()`/`load_docx()`/`load_txt()`/`load_image_ocr()` by extension — full detail in `docs/load-data.md`, including the real limitations of each (e.g. `load_docx()` doesn't extract table content, `load_pdf()` silently drops image-only pages with no text layer).
 
-If no text is found:
-
-```python
-raise ValueError("No text could be extracted from the document.")
-```
-
-#### Step 5: Classify document type
+#### Step 5: Classify the document
 
 ```python
 document_type = self.classification_agent.classify_document(text)
 ```
 
-`ClassificationAgent` (backed by `LLMService` + `prompts/classification_prompt.py`) classifies the document into categories such as:
+Classifies from the **actual extracted text**, categories like `"clinical guideline"`, `"healthcare policy"`, `"patient report"`, etc. (`prompts/classification_prompt.py`'s `DOCUMENT_CATEGORIES`).
 
-```text
-clinical guideline
-patient report
-claims dataset
-healthcare policy
-research publication
-lab result
-administrative document
-unknown
+#### Step 6: Extract entities and relationships, build the graph — the missing step
+
+```python
+extraction = extract_entities_and_relationships(text)
+
+for relationship in extraction["relationships"]:
+    self.graph_store.upsert_edge(
+        source_name=relationship["source"],
+        target_name=relationship["target"],
+        relationship=relationship["relationship"],
+        file_id=file_id,
+        evidence=relationship["evidence"]
+    )
 ```
 
-#### Step 6: Chunk document text
+`extract_entities_and_relationships()` (`tools/entity_extraction.py`) runs spaCy: sentence segmentation, noun-chunk extraction as candidate entities, and — for every pair of entities co-occurring in the same sentence — a relationship, using the dependency parse to find a connecting verb (falling back to `"related_to"` if none is found). Returns `{"entities": [...sorted unique strings...], "relationships": [{"source", "target", "relationship", "evidence"}, ...]}`.
+
+`GraphStoreService.upsert_edge()` upserts both endpoint nodes (deduped by normalized lowercase text, tracking mention count and which `file_id`s mentioned them) and the edge itself into Postgres. **This is what `graph_rag_agent.py` traverses at query time** — without this step running at ingestion, `graph_rag` would have nothing to retrieve. Full detail, including the documented "prototype tier, not Neptune" limitations (co-occurrence heuristic, no entity resolution/synonyms, full graph reload on every query), is in `docs/question-graph-agents-prompts.md` §4.
+
+This step runs **before** chunking/embedding — extraction and classification both need the full, unchunked text.
+
+#### Step 7: Chunk the text
 
 ```python
 text_chunks = chunk_documents(text)
 ```
 
-This splits long text into smaller chunks.
+Standard chunking (`chunk_size=1000, chunk_overlap=150` defaults) — see `docs/rag-utils.md` for the splitter details and its reuse by `SummarizationAgent`'s map-reduce with different parameters.
 
-#### Step 7: Create embeddings
+#### Step 8: Create embeddings
 
 ```python
 embedded_chunks = create_embeddings_for_chunks(text_chunks)
 ```
 
-Each chunk becomes:
+One `EmbeddingService.create_embedding()` call per chunk — not a batch API call, see `docs/rag-utils.md`.
 
-```python
-{
-	"text": "chunk text...",
-	"embedding": [0.12, -0.54, ...]
-}
-```
-
-#### Step 8: Bulk index into OpenSearch
+#### Step 9: Bulk-index into OpenSearch
 
 ```python
 self.vector_store.index_chunks(
-	chunks=embedded_chunks,
-	file_id=file_id,
-	file_name=file_name,
-	document_type=document_type,
-	s3_uri=s3_uri,
-	metadata={
-		"source": "user_upload",
-		"file_extension": Path(file_name).suffix.lower()
-	},
-	batch_size=500
+    chunks=embedded_chunks, file_id=file_id, file_name=file_name,
+    document_type=document_type, s3_uri=s3_uri,
+    metadata={"source": "user_upload", "file_extension": Path(file_name).suffix.lower()},
+    batch_size=500
 )
 ```
 
-Each chunk stores:
+One `helpers.bulk()` call for the whole document instead of one request per chunk — full detail (deterministic chunk IDs, `chunk_size` batching) in `docs/aws-storage.md`.
 
-```text
-chunk_id
-file_id
-chunk_index
-file_name
-document_type
-text
-embedding
-s3_uri
-uploaded_at
-metadata
-```
-
-The important improvement is bulk indexing:
-
-```text
-500 chunks = usually 1 batch request instead of 500 separate OpenSearch requests
-```
-
-#### Step 9: Update status to indexed
+#### Step 10: Update status to `indexed`
 
 ```python
-self.document_store.update_status(
-	file_id=file_id,
-	status="indexed",
-	document_type=document_type
-)
+self.document_store.update_status(file_id=file_id, status="indexed", document_type=document_type)
 ```
 
-Now the document is available for RAG search.
-
-Return value:
+### Return value
 
 ```python
 return {
-	"status": "indexed",
-	"file_id": file_id,
-	"file_name": file_name,
-	"s3_uri": s3_uri,
-	"document_type": document_type,
-	"chunks_indexed": len(embedded_chunks)
+    "status": "indexed",
+    "file_id": file_id,
+    "file_name": file_name,
+    "s3_uri": s3_uri,
+    "document_type": document_type,
+    "chunks_indexed": len(embedded_chunks),
+    "entities_extracted": len(extraction["entities"]),
+    "relationships_extracted": len(extraction["relationships"])
 }
 ```
+
+`entities_extracted` and `relationships_extracted` are new fields since this doc was first written — direct evidence, in the API response itself, that the graph-building step (Step 6) actually ran.
 
 ---
 
 ## 4. Status lifecycle
 
-Both workflows update document status in RDS.
+Both workflows update document status in Postgres, via `DocumentStore.update_status()`.
 
 | Status | Meaning |
 | --- | --- |
-| `uploaded` | File was uploaded and RDS record was created |
+| `uploaded` | File was uploaded and the Postgres record was created |
 | `processing` | The ingestion pipeline is running |
-| `registered` | Structured dataset was registered in Glue |
-| `indexed` | Document chunks were indexed in OpenSearch |
-| `failed` | Ingestion failed |
+| `registered` | Structured dataset was registered in Glue **and** dual-written into Postgres |
+| `indexed` | Document chunks were indexed in OpenSearch **and** its entities/relationships were upserted into the graph |
+| `failed` | Ingestion failed — `error_message` is set, and `processed_at` stays `null` |
+
+`processed_at` is set by `DocumentStore.update_status()` specifically when `status in ["registered", "indexed"]` — not on `"failed"`, which is why a failed document's `processed_at` stays `null` in `GET /documents`.
 
 ---
 
@@ -474,37 +367,19 @@ Both workflows update document status in RDS.
 
 | File | Handles | Final storage |
 | --- | --- | --- |
-| `structured_ingestion_workflow.py` | CSV / structured datasets | S3 + Glue + Athena |
-| `document_ingestion_workflow.py` | PDF / DOCX / TXT | S3 + OpenSearch |
+| `structured_ingestion_workflow.py` | CSV | S3 (raw file) + Glue (Athena schema) + Postgres (metadata **and** the actual dual-written table) |
+| `document_ingestion_workflow.py` | PDF / DOCX / TXT / images | S3 (raw file) + OpenSearch (chunks + embeddings) + Postgres (metadata **and** extracted graph nodes/edges) |
 
-Both use RDS only for tracking metadata and status.
+Both use Postgres for metadata/status tracking (`documents` table) — but that's no longer the *only* thing either workflow puts in Postgres: structured ingestion also writes the real data table there now, and document ingestion also writes the knowledge graph there. Neither workflow's storage footprint is fully captured by "S3 + one other AWS service" anymore.
 
 ---
 
-## 6. How they are used from API routes
+## 6. How they're actually used from `api/routes.py`
 
-Example upload route:
+The original version of this doc showed hand-written pseudocode with its own extension-matching logic and per-request `workflow = StructuredIngestionWorkflow()` construction. That's not how the real route works — see `docs/routers.md` for the accurate walkthrough, but in short:
 
-```python
-from pathlib import Path
-
-from app.backend.workflows.document_ingestion_workflow import DocumentIngestionWorkflow
-from app.backend.workflows.structured_ingestion_workflow import StructuredIngestionWorkflow
-
-
-def ingest_uploaded_file(file_path: str, file_name: str):
-	extension = Path(file_name).suffix.lower()
-
-	if extension in [".csv"]:
-		workflow = StructuredIngestionWorkflow()
-		return workflow.ingest(file_path, file_name)
-
-	if extension in [".pdf", ".docx", ".txt"]:
-		workflow = DocumentIngestionWorkflow()
-		return workflow.ingest(file_path, file_name)
-
-	raise ValueError(f"Unsupported file type: {extension}")
-```
+- Both workflows are **module-level singletons**, constructed once at import time in `api/routes.py`, not per-request.
+- The branch isn't a raw extension check — it's `detect_file_type(local_path) == "structured"` (`tools/data_loader.py`), which also handles `"document"`/`"image"`/`"unknown"` (unknowns rejected with a 400 before either workflow is ever called; images currently fall into the *document* workflow's branch, not a separate one — see `docs/load-data.md` for that specific nuance).
 
 ---
 
@@ -512,11 +387,14 @@ def ingest_uploaded_file(file_path: str, file_name: str):
 
 ```text
 structured_ingestion_workflow.py
-= prepares structured datasets for Athena by uploading to S3 and registering in Glue
+= uploads to S3, classifies the dataset, registers it in Glue for Athena,
+  AND dual-writes it into a real Postgres table for the sql route
 
 document_ingestion_workflow.py
-= prepares unstructured documents for RAG by uploading to S3, chunking, embedding, and indexing in OpenSearch
+= uploads to S3, classifies the text, extracts entities/relationships into
+  the knowledge graph, then chunks/embeds/bulk-indexes into OpenSearch for RAG
 
 document_store_service.py
-= tracks status and metadata for both workflows in RDS
+= tracks status and metadata for both workflows in Postgres (self-hosted,
+  not RDS — see docs/RDS-glue.md)
 ```
