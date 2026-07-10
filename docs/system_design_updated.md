@@ -1,8 +1,4 @@
-# Healthcare Multi-Source Agentic RAG Platform — System Design (Current MVP)
-
-> **Full rewrite.** The previous version of this doc described a much larger, aspirational production-AWS target architecture (Amazon Neptune, ECS Fargate, API Gateway, Cognito, Streamlit frontend, SQS-based async ingestion, a `terraform/`/`data_pipeline/`/`rag/`/`observability/` folder structure) largely as if it were already built. Very little of that matches the actual codebase. This version describes **only what's actually implemented and running today** — a locally-deployable MVP on Docker Compose that uses real AWS services (Bedrock, S3, OpenSearch, Glue, Athena) for the pieces that need them, and self-hosted containers (Postgres, Redis) for everything else. It cross-references the other docs in `docs/` rather than duplicating them — those were fixed to match the code earlier in this pass; this doc ties them together at the system level.
-
----
+# Healthcare Multi-Source Agentic RAG Platform — System Design 
 
 ## 1. Problem Statement, Use Case
 
@@ -21,7 +17,7 @@ Number of patients by diagnosis (chart)                        -> /visualization
 
 ---
 
-## 2. What's Actually Built vs. Not — Honest Answers
+## 2. What's Actually Built vs. Not
 
 ### Business
 

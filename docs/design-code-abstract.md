@@ -1,37 +1,42 @@
-> **Outdated**: `BedrockService` was removed. `classify_text()` moved to `agents/classification_agent.py` (`ClassificationAgent.classify_document()` / `classify_structured_data()`), and `create_embedding()` moved to `services/embedding_service.py`. The overall flow below (classify + embed, then store) is still accurate conceptually — only the class name and file have changed.
+> **Outdated, fixed here**: this section described a `BedrockService` class that no longer exists — it had zero "Outdated" warning in earlier versions of this doc, unlike every other doc in this repo that references it, which was worth calling out and fixing directly rather than leaving unmarked. `classify_text()` split into `ClassificationAgent.classify_document()` / `classify_structured_data()` (via `LLMService`); `create_embedding()` moved to `EmbeddingService.create_embedding()` (via `ModelService`). Both are now thin wrappers around a shared `ModelService` that's the *only* file in the project holding a raw Bedrock client — see `docs/bedrock-service.md` for the line-by-line walkthrough and `docs/model-service.md` for the full agent-to-service architecture diagram; not repeated here.
 
-# bedrock_service:  
-               
+# Classification + embedding, current shape
+
+```text
                 User uploads document
                         │
                         ▼
-                BedrockService
+              DocumentIngestionWorkflow
                   /           \
                  /             \
                 ▼               ▼
-      classify_text()    create_embedding()
-                │               │
+  ClassificationAgent      EmbeddingService
+  .classify_document()     .create_embedding()
+   (via LLMService)          (via ModelService,
+                │              one call per chunk)
                 ▼               ▼
      "patient report"     [0.2,-0.1,...]
                 │               │
                 ├───────────────┤
                         ▼
-            Store in OpenSearch / Vector DB
+       OpenSearchVectorStore.index_chunks()
+          (bulk-indexed, see docs/aws-storage.md)
                         │
                         ▼
-             Future semantic search & RAG
+             Semantic search & RAG retrieval
+```
 
-The classification result is useful for organizing or routing documents, while the embedding is stored in a vector database (such as OpenSearch) so that future user queries can retrieve semantically similar documents.
+The classification result organizes/routes documents (it's what `document_type` becomes in the `documents` table and in each indexed chunk); the embedding is what makes the document retrievable by `RAGAgent` later. Same conceptual shape as the original diagram — classify, embed, store — just through the real current classes.
 
 ## Why this design is good
 
-This class follows several software engineering best practices:
+The same reasoning still holds, updated to the real split across `ModelService`/`LLMService`/`EmbeddingService`/`ClassificationAgent` instead of one `BedrockService`:
 
-- **Single Responsibility Principle:** It only handles communication with AWS Bedrock.
-- **Encapsulation:** The rest of the application doesn't need to know Bedrock API details, request formats, or response parsing.
-- **Reusability:** Any part of the application can call `classify_text()` or `create_embedding()` without duplicating code.
-- **Maintainability:** If you later switch from Claude to another Bedrock model (or even another provider), you only need to update this service instead of changing code throughout the project.
-- **Configuration-driven:** Model IDs and AWS region come from settings, making it easy to use different environments (development, staging, production) without changing the code itself.
+- **Single Responsibility Principle:** `ModelService` only handles communication with AWS Bedrock; `ClassificationAgent`/`EmbeddingService` only handle "what does my use case need from that."
+- **Encapsulation:** No agent needs to know Bedrock's request/response shape — they call `LLMService.generate()` / `EmbeddingService.create_embedding()`.
+- **Reusability:** Nine different agents reuse `LLMService` without duplicating request-building code.
+- **Maintainability:** Switching models only means changing `ModelService`/`config/settings.py` — every caller stays untouched.
+- **Configuration-driven:** Model IDs and AWS region come from `settings`, so different environments don't need code changes.
 
 ------------
 # routers.py
@@ -73,30 +78,25 @@ Cache
       ▼
 Return Response
 
-## 3 most important and new services:
+## Most important services, current shape
 
-Based on this code, every uploaded file is stored in Amazon S3, and metadata about that file is registered separately (using the Glue Catalog and Redis cache).
+> **Corrected**: the original version of this section claimed every uploaded file goes through both Glue and a Redis cache. Verified against the actual ingestion workflows — that's not what happens. `GlueCatalog` is only used by `StructuredIngestionWorkflow` (CSVs); it never appears in `DocumentIngestionWorkflow`. And `CacheService`/Redis isn't used by either ingestion workflow at all — Redis in this project is used exclusively for conversation memory (`MemoryService`, see `docs/cache_memory_service.md`), not upload metadata.
 
 ### Glue Catalog
 
-Registers dataset metadata.
+Registers dataset schema/location metadata for **structured (CSV) uploads only**, so Athena can query them — see `docs/RDS-glue.md`.
 
 ### Classification Agent
 
-Uses an LLM to classify documents.
+Uses an LLM to classify **both** documents and structured datasets — `classify_document(text)` and `classify_structured_data(df)` respectively. Example categories: `clinical guideline`, `patient report`, `claims dataset`. See `docs/question-graph-agents-prompts.md`.
 
-Example:
+### Relational Data Store
 
-clinical guideline
-patient report
-claims dataset
+Not in the original list, but arguably more load-bearing than a cache service for this pipeline: `RelationalDataStore.load_dataframe()` dual-writes every uploaded CSV into a real Postgres table, which is what makes it queryable via the `sql` route in addition to `s3`/Athena. See `docs/RDS-glue.md`.
 
-### Cache Service
+## General flow, current shape
 
-Stores upload metadata in Redis.
-
-## general flow
-
+```text
              User Upload
                   │
                   ▼
@@ -110,16 +110,25 @@ Stores upload metadata in Redis.
           ┌────────┴────────┐
           ▼                 ▼
    Structured         Document/Image
+   (.csv only)
           │                 │
           ▼                 ▼
-     PostgreSQL      OpenSearch
+   Classify dataset    Classify document
+          │                 │
+          ▼                 ▼
+   Glue + Postgres     Entity/relationship extraction
+   (dual-write)        (Postgres graph_nodes/graph_edges)
+          │                 │
+          │                 ▼
+          │            Chunk + embed + OpenSearch
           │                 │
           └────────┬────────┘
                    ▼
-          Glue Metadata Catalog
-                   │
-                   ▼
-               Redis Cache
+          documents table (Postgres)
+          status: "registered" / "indexed"
+```
+
+No universal Glue step, no universal cache step — each branch's storage footprint is genuinely different, and neither branch touches Redis. Full step-by-step detail (including exact field names in each return value) is in `docs/workflows.md`.
 --------------------------
 
 # main.py

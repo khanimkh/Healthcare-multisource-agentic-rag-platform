@@ -1,3 +1,4 @@
+> **Reading guide**: Sections 1–3 below (`bedrock_service.py`, `settings.py`, `router.py`) and the `main.py` section are **generic architectural templates** — the class/field/import names (`AIService`, `cache_url`, `app.schemas...`, `StorageService`) are illustrative placeholders, not this project's real names. They teach a *pattern*, not this codebase specifically. The "AI service layering" section further down, and the pipeline example right before it, **are** meant to describe this project's actual code — the pipeline example had drifted out of date and has been corrected below; the AI service layering section has been fixed to match a diagram error that also existed in `docs/model-service.md` (already fixed there).
 
 ---------------------------------
 # 1. General template coding for a service file: bedrock_service.py
@@ -632,90 +633,85 @@ So, **`List[Dict[str, Any]]` means "a list of dictionaries where every key is a 
 
 -------------------------------
 
-## upload orginal file, read document, classify docs, create chunck and embedings, create bulk list: 
+## Upload original file, read document, classify docs, extract graph facts, chunk and embed, bulk index
+
+> **Corrected**: the previous version of this example imported `app.backend.services.aws_storage` (real path: `services/aws_storage_service.py`), `app.backend.services.bedrock_service` (removed entirely), `app.backend.utils.document_loader` and `app.backend.utils.chunking` (neither exists — the real module is `tools/`, not `utils/`), and called `bedrock.classify_text()`/`bedrock.create_embedding()` on a class that no longer exists. It also omitted the entity/relationship extraction step entirely. This is `DocumentIngestionWorkflow.ingest()`'s real logic (see `docs/workflows.md` for the full field-by-field breakdown), not a hypothetical:
 
 ```python
-from app.backend.services.aws_storage import AWSStorage, OpenSearchVectorStore
-from app.backend.services.bedrock_service import BedrockService
-from app.backend.utils.document_loader import load_pdf
-from app.backend.utils.chunking import split_text_into_chunks
+from app.backend.agents.classification_agent import ClassificationAgent
+from app.backend.services.aws_storage_service import AWSStorage, OpenSearchVectorStore
+from app.backend.services.graph_store_service import GraphStoreService
+from app.backend.tools.data_loader import load_document
+from app.backend.tools.entity_extraction import extract_entities_and_relationships
+from app.backend.tools.rag_utils import chunk_documents, create_embeddings_for_chunks
 
 
-def ingest_uploaded_pdf(file_path: str, file_name: str):
+def ingest_uploaded_document(file_path: str, file_name: str):
     """
-    Full ingestion pipeline:
-    1. Upload PDF to S3
-    2. Read PDF text
-    3. Split text into chunks
-    4. Create embeddings
-    5. Store chunks + vectors in OpenSearch
+    Full ingestion pipeline for a document (PDF/DOCX/TXT/image):
+    1. Upload original file to S3
+    2. Extract text
+    3. Classify document type
+    4. Extract entities/relationships into the knowledge graph
+    5. Split text into chunks
+    6. Create embeddings
+    7. Bulk-index chunks + vectors into OpenSearch
     """
 
-    # Initialize services
+    # Initialize services/agents
     storage = AWSStorage()
-    bedrock = BedrockService()
+    classification_agent = ClassificationAgent()
+    graph_store = GraphStoreService()
     vector_store = OpenSearchVectorStore()
 
     # Step 1: Upload original file to S3
-    upload_result = storage.upload_file_to_s3(
-        file_path=file_path,
-        file_name=file_name
-    )
+    upload_result = storage.upload_file_to_s3(file_path=file_path, file_name=file_name)
+    file_id, s3_uri = upload_result["file_id"], upload_result["s3_uri"]
 
-    file_id = upload_result["file_id"]
-    s3_uri = upload_result["s3_uri"]
+    # Step 2: Extract text — dispatches to load_pdf/load_docx/load_txt/load_image_ocr by extension
+    text = load_document(file_path)
 
-    # Step 2: Read document text
-    text = load_pdf(file_path)
+    # Step 3: Classify document type — via ClassificationAgent -> LLMService, not a removed BedrockService
+    document_type = classification_agent.classify_document(text)
 
-    # Step 3: Classify document type
-    document_type = bedrock.classify_text(text)
+    # Step 4: Extract entities/relationships (spaCy) and upsert into the knowledge graph
+    extraction = extract_entities_and_relationships(text)
+    for relationship in extraction["relationships"]:
+        graph_store.upsert_edge(
+            source_name=relationship["source"], target_name=relationship["target"],
+            relationship=relationship["relationship"], file_id=file_id,
+            evidence=relationship["evidence"]
+        )
 
-    # Step 4: Split text into chunks
-    text_chunks = split_text_into_chunks(
-        text=text,
-        chunk_size=1000,
-        chunk_overlap=200
-    )
+    # Step 5: Split text into chunks (default chunk_size=1000, chunk_overlap=150)
+    text_chunks = chunk_documents(text)
 
-    # Step 5: Create embedding for each chunk
-    chunks = []
+    # Step 6: Create one embedding per chunk (via EmbeddingService, not a manual bedrock.create_embedding loop)
+    embedded_chunks = create_embeddings_for_chunks(text_chunks)
 
-    for chunk_text in text_chunks:
-        embedding = bedrock.create_embedding(chunk_text)
-
-        chunks.append({
-            "text": chunk_text,
-            "embedding": embedding
-        })
-
-    # Step 6: Create index if needed + bulk save vectors
+    # Step 7: Bulk-index into OpenSearch — auto-creates the index on first call
     vector_store.index_chunks(
-        chunks=chunks,
-        file_id=file_id,
-        file_name=file_name,
-        document_type=document_type,
-        s3_uri=s3_uri,
-        metadata={
-            "source": "user_upload"
-        },
-        batch_size=500
+        chunks=embedded_chunks, file_id=file_id, file_name=file_name,
+        document_type=document_type, s3_uri=s3_uri,
+        metadata={"source": "user_upload"}, batch_size=500
     )
 
     return {
-        "status": "success",
+        "status": "indexed",
         "file_id": file_id,
         "file_name": file_name,
         "document_type": document_type,
         "s3_uri": s3_uri,
-        "chunks_indexed": len(chunks)
+        "chunks_indexed": len(embedded_chunks),
+        "entities_extracted": len(extraction["entities"]),
+        "relationships_extracted": len(extraction["relationships"])
     }
 ```
 
 Example call:
 
 ```python
-result = ingest_uploaded_pdf(
+result = ingest_uploaded_document(
     file_path="data/clinical_guideline.pdf",
     file_name="clinical_guideline.pdf"
 )
@@ -726,10 +722,11 @@ print(result)
 The flow is:
 
 ```text
-PDF
+Document/image
 -> upload to S3
 -> extract text
 -> classify document type
+-> extract entities/relationships -> upsert into knowledge graph
 -> split into chunks
 -> create embedding per chunk
 -> create OpenSearch index if it does not exist
@@ -764,19 +761,22 @@ As a project grows, a single service file that both talks to the raw API **and**
 
 ## The layers
 
+> **Corrected**: the diagram below used to draw `ClassificationAgent` feeding directly into `ModelService`, parallel to `LLMService`. That doesn't match the real code — `ClassificationAgent.__init__` does `self.llm_service = LLMService()`, exactly like every other agent. It was a genuine diagram/prose mismatch: the "In plain words" section right below already described it correctly. Fixed here, and the same fix was already made in `docs/model-service.md`. The "Agents" box also only listed 6 of the 9 real agents (`graph_rag`, `classification`, and `chart` — the newest one — were missing); all 9 are listed now.
+
 ```text
-Ingestion (rag_utils.py,                    Agents (router, rag, sql, s3,
-document_ingestion_workflow.py,             summarization, final answer)
-structured_ingestion_workflow.py)                  │
-        │                                          ▼
-        ▼                                    LLMService          <- text generation only
-  EmbeddingService  ◄──┐                           │                 (generate, generate_with_history)
-        │              │                           │
-        │        ClassificationAgent                │
-        │        (classify_document,                │
-        │        classify_structured_data)          │
-        │              │                            │
-        ▼              ▼                            ▼
+Ingestion (rag_utils.py,                    Agents that reason (router, rag, sql, s3,
+document_ingestion_workflow.py,             chart, classification, summarization,
+structured_ingestion_workflow.py)           final_answer, graph_rag) — 9 total
+        │                                          │
+        ▼                                          ▼
+  EmbeddingService                          LLMService          <- text generation only
+        │                                          │                 (generate, generate_with_history)
+        │                                          │
+        │              ClassificationAgent ────────┤  (just another LLMService consumer,
+        │              (classify_document,          │   not a separate direct-to-ModelService path)
+        │               classify_structured_data)   │
+        │                                            │
+        ▼                                            ▼
               ModelService  ◄─────────────────────────
                     │
                     ▼
@@ -796,9 +796,11 @@ EmbeddingService      = single source of truth for "turn text into a vector".
                        and by retrieval (embedding the user's question in RAGAgent).
 
 LLMService            = single source of truth for "turn a prompt into an answer".
-                       Composes ModelService. Used by agents that reason/generate
-                       text (router, rag, sql, s3, summarization, classification,
-                       final answer, graph_rag).
+                       Composes ModelService. Used by all 9 agents that reason/
+                       generate text: router, rag, sql, s3, chart, summarization,
+                       classification, final_answer, graph_rag. `chart_agent.py`
+                       is the newest addition, powering the Insights tab's chart
+                       explorer — it is NOT part of question_graph.py's routing.
 
 ClassificationAgent    = classifies uploaded content into a category, via LLMService +
                        prompts/classification_prompt.py. Used by both ingestion
@@ -827,8 +829,9 @@ If prompt-building and raw `invoke_model` boilerplate live in the same class, ev
 | --- | --- | --- | --- |
 | `model_service.py` | ✅ Yes | Generic `invoke_text_model` / `invoke_embedding_model` calls to Bedrock Runtime | `embedding_service.py`, `llm_service.py` |
 | `embedding_service.py` | No | Turn text into a vector (single chunk or batch) | `rag_utils.py` (ingestion), `rag_agent.py` (retrieval) |
-| `llm_service.py` | No | Turn a prompt (optionally with conversation history) into a generated answer | All agents: router, rag, sql, s3, graph_rag, summarization, classification, final answer |
+| `llm_service.py` | No | Turn a prompt (optionally with conversation history) into a generated answer | All 9 agents: router, rag, sql, s3, chart, graph_rag, summarization, classification, final_answer |
 | `agents/classification_agent.py` | No | Classify a document's text or a structured dataset's columns into a category | `document_ingestion_workflow.py`, `structured_ingestion_workflow.py`, `question_graph.py` |
+| `agents/chart_agent.py` | No | Generate/execute aggregation SQL for the chart explorer, propose chart-worthy questions | `visualization_workflow.py` (separate from `question_graph.py` — see `docs/question-graph-agents-prompts.md` §4) |
 | `memory_service.py` | N/A (Postgres + Redis, not Bedrock) | Store/retrieve conversation turns per session | `question_graph.py`, `question_workflow.py` |
 
 ---
@@ -843,13 +846,13 @@ ModelService.invoke_text_model() / invoke_embedding_model()
    │
    ├──► EmbeddingService.create_embedding()   -> used at ingestion + retrieval time
    │
-   ├──► LLMService.generate()  ◄──────────────── ClassificationAgent builds a prompt via
-   │        │                                    prompts/classification_prompt.py and calls
-   │        ▼                                    this, same as every other agent
-   │    Agents build task prompts and call LLMService
-   │
-   └──► LLMService.generate_with_history()    -> reads prior turns from MemoryService
+   └──► LLMService.generate()  ◄──────────────── ClassificationAgent builds a prompt via
+            │                                    prompts/classification_prompt.py and calls
+            ▼                                    this, same as every other agent
+        Agents build task prompts and call LLMService
 ```
+
+`LLMService.generate_with_history()` exists (builds a prompt from a conversation history plus a new question, then delegates to `generate()`) but — verified by checking for callers — **has none** as of this writing. The actual conversation-memory path is different: `QuestionWorkflow` reads recent turns via `MemoryService.get_recent_messages()` and threads them into `state["conversation_context"]`, which only `RouterAgent.route()` ever reads (see `docs/question-graph-agents-prompts.md` §7 and `docs/bedrock-service.md`). `generate_with_history()` is a ready-to-use alternative, not part of the active call path — don't assume it's wired in just because it exists.
 
 ------------------------------------
 
